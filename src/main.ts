@@ -16,7 +16,13 @@ export const envSchema = commonEnv.omit({ SERVICE_NAME: true }).extend({
   NATS_SERVERS: z
     .string()
     .min(1)
-    .transform((value) => value.split(",").map((server) => server.trim())),
+    .transform((value) =>
+      value
+        .split(",")
+        .map((server) => server.trim())
+        .filter((server) => server !== ""),
+    )
+    .pipe(z.array(z.string()).min(1)),
   NATS_USER: z.string().min(1),
   NATS_PASSWORD: z.string().min(1),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.url().optional(),
@@ -29,9 +35,16 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
   const release = config.RELEASE;
   const telemetry = startTelemetry({ serviceName: service, release });
   const logger = createLogger({ service, release, level: config.LOG_LEVEL });
-  const mongo = await connectMongo({ url: config.MONGODB_URI, database: config.MONGODB_DATABASE });
-  await runMigrations(mongo.db, [eventStoreMigration]);
+  logger.info("connecting to MongoDB");
+  const mongo = await connectMongo({
+    url: config.MONGODB_URI,
+    database: config.MONGODB_DATABASE,
+    clientOptions: { serverSelectionTimeoutMS: 5000 },
+  });
+  const migrations = [eventStoreMigration];
+  await runMigrations(mongo.db, migrations);
   const store = createEventStore(mongo.db);
+  logger.info("connecting to NATS");
   const nats = await connectNats({
     servers: config.NATS_SERVERS,
     user: config.NATS_USER,
@@ -43,7 +56,14 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
   const app = createService({
     logger,
     routes: routes({ store, newId: randomUUID }),
-    readiness: { mongo: mongo.ready, nats: nats.ready, relay: relay.ready },
+    readiness: {
+      mongo: mongo.ready,
+      migrations: async () =>
+        (await mongo.db
+          .collection<{ _id: string }>("migrations")
+          .countDocuments({ _id: { $in: migrations.map((migration) => migration.name) } })) ===
+        migrations.length,
+    },
     metrics: telemetry.metricsHandler,
     closeHooks: [telemetry.shutdown, mongo.close, nats.close, relay.close],
     ...options,
@@ -54,6 +74,11 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
 }
 
 if (import.meta.main) {
+  const exitEarly = (): never => process.exit(143);
+  process.once("SIGTERM", exitEarly);
+  process.once("SIGINT", exitEarly);
   const { app } = await start(loadConfig(envSchema));
+  process.off("SIGTERM", exitEarly);
+  process.off("SIGINT", exitEarly);
   app.handleSignals();
 }

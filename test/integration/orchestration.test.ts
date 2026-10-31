@@ -155,9 +155,17 @@ const published = async (eventId: string): Promise<void> => {
   await waitFor(async () => (await events().findOne({ _id: eventId }))?.publishedAt != null);
 };
 
-test("the service is ready with MongoDB, NATS and the ORCHESTRATION stream", async () => {
+test("the service is ready when MongoDB answers and the migrations are done", async () => {
   const response = await fetch(`${base}/ready`);
   assert.equal(response.status, 200);
+  await mongo.db.collection<{ _id: string }>("migrations").deleteOne({ _id: "000-event-store" });
+  const missing = await fetch(`${base}/ready`);
+  assert.equal(missing.status, 503);
+  assert.deepEqual(((await missing.json()) as { failing: string[] }).failing, ["migrations"]);
+  await mongo.db
+    .collection<{ _id: string; appliedAt: Date }>("migrations")
+    .insertOne({ _id: "000-event-store", appliedAt: new Date() });
+  assert.equal((await fetch(`${base}/ready`)).status, 200);
 });
 
 test("a submitted task is in MongoDB once and in ORCHESTRATION once", async () => {
@@ -209,6 +217,22 @@ test("the replay API gives a page of events in position order", async () => {
     events: unknown[];
   };
   assert.deepEqual(page.events, all.events.slice(1, 3));
+});
+
+test("without the stream the service stays ready and the event waits in the outbox", async () => {
+  await manager.streams.delete("ORCHESTRATION");
+  const response = await submit(randomUUID());
+  assert.equal(response.status, 201);
+  const { taskId } = (await response.json()) as { taskId: string };
+  assert.equal((await fetch(`${base}/ready`)).status, 200);
+  const [stored] = await events()
+    .find({ streamId: `task-${taskId}` })
+    .toArray();
+  const eventId = stored?._id ?? "";
+  assert.equal(stored?.publishedAt, null);
+  await createStreams(admin.connection, [{ name: "ORCHESTRATION", subjects: ["orchestration.>"] }]);
+  await published(eventId);
+  assert.equal((await streamMessages(eventId)).length, 1);
 });
 
 test("after a restart the service publishes the pending events", async () => {
