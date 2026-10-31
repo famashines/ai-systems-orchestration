@@ -51,9 +51,16 @@ jobs:
           image: ${{ env.IMAGE }}
           format: cyclonedx-json
           output-file: sbom.cdx.json
-          artifact-name: sbom.cdx.json
+          upload-artifact: false
           upload-release-assets: false
           github-token: ""
+
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: sbom.cdx.json
+          path: sbom.cdx.json
+          if-no-files-found: error
 
       - name: Scan the image
         uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439
