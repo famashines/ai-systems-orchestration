@@ -151,6 +151,17 @@ Node 26 slim, pinned by digest, with no npm, no npx and no test packages
 writes nothing to disk, so a read-only root file system works. There is no
 `HEALTHCHECK`; Kubernetes uses `/health` and `/ready`.
 
+Release: when `ci` passes on a push to `main`, `.github/workflows/release.yml`
+builds the image of that commit, makes a CycloneDX SBOM (a workflow
+artifact), and scans the image with grype. A HIGH or CRITICAL finding that
+has a fix stops the release. Findings with no fix do not stop it; they are
+in the job log. Then it pushes `ghcr.io/famashines/ai-systems-orchestration:sha-<commit>`
+and opens or updates the pull request from the branch
+`release/ai-systems-orchestration-prod` in `famashines/gitops`. That pull request sets the
+tag and the digest in `kubernetes/ai-systems/ai-systems-orchestration/prod`. The owner
+merges it. The job needs the org secret `GITOPS_TOKEN` with access to this
+repo. A manual run (`workflow_dispatch`) works only on `main`.
+
 ## Test
 
 | Command                    | Does                                                 |
