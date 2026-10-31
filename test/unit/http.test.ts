@@ -86,7 +86,8 @@ test("mode is approval when the payload has no mode", async () => {
   const response = await submit(envelope({ payload: { text: "Plan a trip" } }));
   const { taskId } = (await response.json()) as { taskId: string };
   const [event] = await store.readStream(`task-${taskId}`);
-  assert.equal(event?.payload.mode, "approval");
+  assert.equal(event?.type, "orchestration.TaskSubmitted");
+  assert.equal(event.payload.mode, "approval");
 });
 
 test("SubmitTask on an existing stream gives 409", async () => {
