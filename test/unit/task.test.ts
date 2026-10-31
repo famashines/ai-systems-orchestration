@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ConflictError } from "@famashines/ai-systems-kit/http";
 import {
   decide,
   evolve,
   initialState,
+  TaskExistsError,
   taskStreamId,
   type TaskCommand,
   type TaskEvent,
@@ -28,8 +28,13 @@ test("given no events, when SubmitTask, then TaskSubmitted", () => {
   assert.deepEqual(given([]).when(submit)(), [submitted]);
 });
 
-test("given TaskSubmitted, when SubmitTask, then a conflict", () => {
-  assert.throws(given([submitted]).when(submit), ConflictError);
+test("given TaskSubmitted, when SubmitTask, then TaskExistsError", () => {
+  assert.throws(given([submitted]).when(submit), TaskExistsError);
+});
+
+test("evolve refuses an unknown event type", () => {
+  const unknown = { ...submitted, type: "orchestration.Unknown" } as unknown as TaskEvent;
+  assert.throws(() => evolve(initialState, unknown), /Unknown event type orchestration.Unknown/);
 });
 
 test("TaskSubmitted gives the submitted state", () => {
