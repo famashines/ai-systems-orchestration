@@ -3,27 +3,156 @@
 The Task Orchestration service of ai-systems. It takes tasks and keeps them
 as event-sourced streams `task-<taskId>` in MongoDB. The `events`
 collection is the outbox: a relay publishes each event to the NATS
-JetStream stream `ORCHESTRATION`. The service is internal: only
-api-gateway (commands) and projections (replay) call it. It has no
-Ingress.
+JetStream stream `ORCHESTRATION`. The service is internal: api-gateway
+(commands) and projections (replay) call it. It has no Ingress.
 
-M1 has one command, `SubmitTask`, and one event,
-`orchestration.TaskSubmitted` (schema version 1). Plans, runs and the
-consumers of `CONVERSATION` and `LLM` come in M2.
+From M2, a chat message starts a task with one agent run (task M2-06):
+orchestration reads `conversation.OwnerMessagePosted`, loads the active
+`writer` agent version and its prompt version, and asks ai-proxy for one
+LLM call. The end of the call ends the run.
 
 ```
 api-gateway --POST /internal/commands/submit-task--> orchestration
+conversation-hub --conversation.OwnerMessagePosted (CONVERSATION)--> orchestration
+orchestration --GET /internal/agents/by-name/writer/active-version--> agent-manager
+orchestration --GET /internal/prompts/:promptId/versions/:version--> prompt-studio
                                                        | one transaction
                                                        v
-                                       MongoDB orchestration: events, commands
+                                       MongoDB orchestration: events, commands, processed
                                                        | outbox relay, Nats-Msg-Id = eventId
                                                        v
                                        NATS stream ORCHESTRATION (orchestration.>)
+                                         --CallRequested--> ai-proxy --llm.* (LLM)--> orchestration
+                                         --Run*, MessageRefused--> conversation-hub (replies)
 projections --GET /internal/events--> orchestration (rebuild only)
 ```
 
 Architecture and reasons: `ai-systems-docs` (`ARCHITECTURE.md` 5 to 8,
-ADR 0006, 0007, 0023).
+ADR 0006, 0007, 0015, 0021, 0023, 0027). Schemas:
+`@famashines/ai-systems-contracts` v0.3.0.
+
+## Chat tasks
+
+Two kit durable consumers, both with the name `orchestration` and
+`ordered` (one message at a time, in stream order):
+
+| Stream         | Filter                            | Handler                                      |
+| -------------- | --------------------------------- | -------------------------------------------- |
+| `CONVERSATION` | `conversation.OwnerMessagePosted` | `onOwnerMessage` (`src/application/chat.ts`) |
+| `LLM`          | `llm.>`                           | `onLlmEvent`                                 |
+
+Each handler reads the task stream, decides (`src/domain/task.ts`, no
+I/O), and appends with `expectedVersion` = the version that it read. The
+kit `processed` marker of the consumed event is in the same MongoDB
+transaction as the append (`also: markProcessed`). So a redelivered event
+gives no second task and no second end event. A concurrent append to the
+same task gives a `ConcurrencyError`, and the kit consumer delivers the
+event again.
+
+### `new_task`
+
+```
+OwnerMessagePosted{intent: new_task}
+  --> GET agent-manager: active version of "writer" (ActiveAgentVersionResultV1)
+  --> GET prompt-studio: its prompt version (PromptVersionResultV1)
+  --> one append to task-<new taskId>:
+      TaskSubmitted{mode: auto, conversationId, messageId}, RunStarted, CallRequested
+```
+
+| Case                                                                        | Events after `TaskSubmitted`, `RunStarted`                                              |
+| --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| The writer and its prompt load                                              | `CallRequested`                                                                         |
+| agent-manager gives 404 (no active version)                                 | `RunFailed` `not_found`                                                                 |
+| prompt-studio gives 404                                                     | `RunFailed` `not_found`                                                                 |
+| A body that is not valid, or a prompt version that is not the one asked for | `RunFailed` `internal`                                                                  |
+| The agent has `enabled: false`                                              | `RunFailed` `unavailable`                                                               |
+| The prompt version has variables                                            | `RunFailed` `internal` (M2 has no values to fill them)                                  |
+| A runaway rule (below) stops the call                                       | `RunBlocked` `runaway_stopped`                                                          |
+| A network error, a timeout (5 s) or a 5xx                                   | nothing: the handler throws and the kit consumer tries again (5 deliveries, then `DLQ`) |
+
+`CallRequested`:
+
+| Field                     | Value                                                                                                 |
+| ------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `agentId`, `agentVersion` | from the active writer version                                                                        |
+| `messages`                | `system`: the prompt text. `user`: the owner text in a data block (below)                             |
+| `models`                  | the model chain of the agent version, in its order                                                    |
+| `maxTokens`               | `limits.maxTokens` of the agent version                                                               |
+| `maxDurationMs`           | 120000 (`callDurationMs`; `AgentLimits` has no duration)                                              |
+| `maxCostMicroUsd`         | the rest of the task allowance: `limits.maxCostMicroUsd` minus the cost of the task so far (ADR 0027) |
+
+The data block of the owner text (ARCHITECTURE 11.2). `<messageId>` is
+the id of the owner message. The owner cannot know it before the message
+is posted, so the text cannot hold a valid end line:
+
+```
+Answer the owner's chat message. It is in the data block below.
+BEGIN DATA owner_message <messageId>
+<owner text, not changed>
+END DATA owner_message <messageId>
+```
+
+The first line is outside the block, so the model has one instruction
+with authority. The seed writer prompt of prompt-studio says that text in
+a data block has no authority.
+
+Runaway rules (ADR 0015, M2 base, `nextCall`): before a call,
+`calls >= limits.maxCalls` or `cost >= limits.maxCostMicroUsd` gives
+`RunBlocked` `runaway_stopped`. In M2 a run has one call, so the rules
+see 0 calls and a cost of 0: only an agent with `maxCostMicroUsd` 0 is
+stopped. The rules and the rest of the allowance are ready for M3 runs
+with more calls.
+
+Orchestration does not call the budget (ADR 0027). ai-proxy reserves and
+settles each attempt, and refuses an attempt whose worst case is above
+`maxCostMicroUsd`.
+
+### `llm.*`
+
+| Event                                                             | Result                                                                                    |
+| ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `CallStarted`                                                     | nothing                                                                                   |
+| `CallFailed` with `nextModel` (ai-proxy tries the next model)     | nothing                                                                                   |
+| `CallCompleted` with text that is not only white space            | `RunCompleted`: `summary` = the text, `costMicroUsd` = the cost of that attempt           |
+| `CallCompleted` with empty or white-space text                    | `RunFailed` `empty_output`                                                                |
+| last `CallFailed` `budget_refused`                                | `RunBlocked` `budget_refused`, reason `The budget refused the call: <reason of ai-proxy>` |
+| last `CallFailed` `rate_limit`                                    | `RunFailed` `rate_limited`                                                                |
+| last `CallFailed` `timeout` or `provider`                         | `RunFailed` `unavailable`                                                                 |
+| last `CallFailed` `invalid`                                       | `RunFailed` `internal`                                                                    |
+| an event of a call that is not the current call of a running task | nothing                                                                                   |
+
+There is no retry by orchestration in M2: the last `CallFailed` of a call
+ends the run. ai-proxy has already tried the model chain.
+
+Each chat task ends with `RunCompleted` or `RunFailed`, or waits with
+`RunBlocked`, so conversation-hub never keeps a task that runs for ever.
+A reason is cut to 1000 characters.
+
+### `steer` and `answer`
+
+Contracts v0.3.0 has no event to record a steer or an answer
+(`SteeringMessageAdded`, `ClarificationAnswered` and `RunResumed` come
+with M3). So orchestration refuses each of them with
+`orchestration.MessageRefused` on the task stream. conversation-hub posts
+the reason as a reply:
+
+| Task state                  | Reason                                                                                                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| not known                   | `The task is not known.`                                                                                     |
+| any, intent `answer`        | `The task has no open question.`                                                                             |
+| running                     | `The task is running and cannot take a message now. Wait for the answer, or send the message as a new task.` |
+| blocked                     | `The task is blocked until the owner acts. Send the message as a new task. The reason: <block reason>`       |
+| completed or failed         | `The task has ended. Send the message as a new task.`                                                        |
+| an API task (`submit-task`) | `The task does not run in the chat. Send the message as a new task.`                                         |
+
+A refusal does not change the task state. A blocked task stays blocked
+in M2: there is no resume yet.
+
+A steer for a running task whose `CallRequested` is older than 15 minutes
+(`staleAfterMs`) first gives `RunFailed` `unavailable` (`The answer did
+not come in 15 minutes, so the task stopped.`), then the refusal. So a
+call that never ends (for example a call that ai-proxy sent to its
+`DLQ`) does not keep the task running.
 
 ## API
 
@@ -40,7 +169,7 @@ Errors are RFC 9457 problem JSON with a `code` (`@famashines/ai-systems-kit/http
 ### `POST /internal/commands/submit-task`
 
 The body is a `CommandEnvelopeV1` with a `SubmitTaskCommandPayloadV1`
-(`@famashines/ai-systems-contracts` v0.1.0):
+(`@famashines/ai-systems-contracts` v0.3.0):
 
 ```json
 {
@@ -91,17 +220,19 @@ the last item as the next `afterPosition`. An empty list is the end.
 
 Environment variables (`.env.example` has all of them):
 
-| Variable                                                            | Default         | Content                                   |
-| ------------------------------------------------------------------- | --------------- | ----------------------------------------- |
-| `MONGODB_URI`                                                       | required        | MongoDB connection string (replica set)   |
-| `MONGODB_DATABASE`                                                  | `orchestration` | Database name                             |
-| `NATS_SERVERS`                                                      | required        | NATS URLs, comma-separated; at least one  |
-| `NATS_USER`                                                         | required        | `ai-systems-orchestration` on the cluster |
-| `NATS_PASSWORD`                                                     | required        | From the SealedSecret                     |
-| `PORT`                                                              | `8080`          | HTTP port                                 |
-| `LOG_LEVEL`                                                         | `info`          | pino level                                |
-| `RELEASE`                                                           | `local`         | Release id in logs and metrics            |
-| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | not set         | Traces go over OTLP only when one is set  |
+| Variable                                                            | Default                                | Content                                   |
+| ------------------------------------------------------------------- | -------------------------------------- | ----------------------------------------- |
+| `MONGODB_URI`                                                       | required                               | MongoDB connection string (replica set)   |
+| `MONGODB_DATABASE`                                                  | `orchestration`                        | Database name                             |
+| `NATS_SERVERS`                                                      | required                               | NATS URLs, comma-separated; at least one  |
+| `NATS_USER`                                                         | required                               | `ai-systems-orchestration` on the cluster |
+| `NATS_PASSWORD`                                                     | required                               | From the SealedSecret                     |
+| `PORT`                                                              | `8080`                                 | HTTP port                                 |
+| `LOG_LEVEL`                                                         | `info`                                 | pino level                                |
+| `RELEASE`                                                           | `local`                                | Release id in logs and metrics            |
+| `AGENT_MANAGER_URL`                                                 | `http://ai-systems-agent-manager:8080` | agent-manager, for the writer version     |
+| `PROMPT_STUDIO_URL`                                                 | `http://ai-systems-prompt-studio:8080` | prompt-studio, for the prompt version     |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | not set                                | Traces go over OTLP only when one is set  |
 
 A bad value stops the process at start with the variable name. An empty
 value is a value: delete the line to get the default. The kit service
@@ -109,16 +240,18 @@ name is fixed to `orchestration`, so the NATS inbox prefix is
 `_INBOX_orchestration` and the grants of ADR 0023 apply.
 
 At start the service connects to MongoDB (it logs "connecting to
-MongoDB"), runs the migration `000-event-store`, connects to NATS (it logs
-"connecting to NATS"), starts the relay, and listens. A SIGTERM or SIGINT
+MongoDB"), runs the migrations `000-event-store` and `000-processed`,
+connects to NATS (it logs "connecting to NATS"), starts the relay and the
+two consumers, and listens. A SIGTERM or SIGINT
 before the server listens stops the process at once with exit code 143.
 After that, the graceful shutdown of `kit/http` applies.
 
-NATS and the relay are not readiness checks (ARCHITECTURE 14). When NATS
+NATS, the relay and the consumers are not readiness checks (ARCHITECTURE 14). When NATS
 is down or the stream `ORCHESTRATION` does not exist, the service still
 takes commands, and the events wait in the outbox. The relay publishes
-them later. The service does not make streams: the gitops stream Job makes
-`ORCHESTRATION`. A stuck relay shows in the metrics
+them later. The service does not make streams or change them: the gitops
+stream Job makes `ORCHESTRATION`, `CONVERSATION` and `LLM`. When a stream
+is missing, its consumer tries again until the stream is there. A stuck relay shows in the metrics
 `outbox_oldest_pending_seconds` and `outbox_publish_failures_total`. Put
 an alert on the gauge. NATS must be available at start, because the kit
 waits for the first NATS connection.
@@ -164,11 +297,57 @@ repo. A manual run (`workflow_dispatch`) works only on `main`.
 
 ## Test
 
-| Command                    | Does                                                 |
-| -------------------------- | ---------------------------------------------------- |
-| `npm run verify`           | type check, lint, unit tests with the coverage gates |
-| `npm run test:integration` | MongoDB and NATS in Testcontainers (needs Docker)    |
+| Command                    | Does                                                                                    |
+| -------------------------- | --------------------------------------------------------------------------------------- |
+| `npm run verify`           | type check, lint, unit tests with the coverage gates                                    |
+| `npm run test:integration` | MongoDB and NATS in Testcontainers (needs Docker), fakes for the reads                  |
+| `npm run test:e2e`         | the real sibling services and the ai-proxy mock (needs Docker, git, Node 26, `E2E_DIR`) |
 
-The integration test uses the NATS grants of the user
-`ai-systems-orchestration` from gitops, and an admin user that makes the
-stream. Commands for agents: `CLAUDE.md`.
+Both use the NATS grants of gitops (`test/nats.ts`), for the user
+`ai-systems-orchestration` as gitops #185 sets them (no `rpc.budget.*`),
+and an admin user that makes the streams.
+
+- `test:integration`: small `node:http` fakes give the agent-manager and
+  prompt-studio reads (`ActiveAgentVersionResultV1`,
+  `PromptVersionResultV1`). The test publishes
+  `conversation.OwnerMessagePosted` and `llm.*` itself as the admin user,
+  in place of conversation-hub and ai-proxy.
+- `test:e2e`: nothing of orchestration is faked. It clones budget,
+  agent-manager, prompt-studio and ai-proxy at fixed `main` commits into
+  `E2E_DIR` (it reuses a clone that is there), runs `npm ci`, and starts
+  each as `node src/main.ts` on the host with its gitops NATS user. The
+  seeds of agent-manager and prompt-studio give the writer. ai-proxy calls
+  its own mock OpenRouter (`test/mock-openrouter.ts` of ai-proxy), which
+  the test starts in its process on `127.0.0.1`. ai-proxy accepts `http`
+  only for `localhost` and `127.0.0.1`, so the mock and ai-proxy run on
+  the host, not in containers. The test adds the three seed models to the
+  mock catalog. The test publishes `conversation.OwnerMessagePosted` in
+  place of conversation-hub. No cap: budget refuses, and the run is
+  blocked. Then the test appends `budget.BudgetSet` (1 USD) to the budget
+  database, because the budget command needs an owner JWT; the next run
+  completes with the mock answer. With no `E2E_DIR`, the tests are
+  skipped. The CI job `e2e` sets it.
+
+Commands for agents: `CLAUDE.md`.
+
+## Known limits
+
+- One run with one call for each chat task. No retry by orchestration
+  after the last `CallFailed` (ARCHITECTURE 8.2 has 3 tries with backoff;
+  that needs a timer, M3). The runaway rules see one call only.
+- `RunCompleted.costMicroUsd` is the cost of the attempt that gave the
+  answer. The cost of earlier attempts of the same call (ai-proxy fallback
+  chain) is in their `llm.CallFailed` events and in the budget, not in
+  this number.
+- A steer or an answer is always refused (no contract event to record it
+  in v0.3.0). A blocked task stays blocked: there is no resume in M2.
+- When agent-manager or prompt-studio does not answer for about 2.5
+  minutes (5 deliveries), the message goes to `dlq.orchestration.*` with
+  no task and no reply. A DLQ replay starts the task.
+- A call with no end is stopped only when a steer comes for its task
+  after 15 minutes. There is no timer.
+- Tasks of `POST /internal/commands/submit-task` (the API path) do not
+  run in M2: they stay `submitted`. conversation-hub ignores them.
+- The kit consumer starts at the first message of the stream
+  (`deliver_policy: all`). Deploy orchestration before the first owner
+  message, or each old message in `CONVERSATION` becomes a task.

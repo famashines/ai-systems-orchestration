@@ -13,23 +13,28 @@ Rules for all ai-systems repos: `ai-systems-docs/CLAUDE.md`
 | `npm test`                 | unit tests, two coverage gates (see below)                       |
 | `npm run verify`           | check, lint and test                                             |
 | `npm run test:integration` | `test/integration` with Testcontainers (needs Docker)            |
+| `npm run test:e2e`         | `test/e2e`; set `E2E_DIR` to a scratch folder, else it skips     |
 | `npm start`                | `node src/main.ts`                                               |
 
 ## Layout
 
 ```
 src
-├── domain/task.ts             decide, evolve, no I/O
+├── domain/task.ts             decide, evolve, data block, runaway rules, no I/O
 ├── application/submit-task.ts the command handler
+├── application/chat.ts        the handlers of OwnerMessagePosted and llm.*
 ├── adapters/http.ts           routes, zod schemas of the bodies and queries
+├── adapters/writer.ts         reads of agent-manager and prompt-studio
 └── main.ts                    config, wiring by constructor, start, shutdown
 test
+├── nats.ts                    gitops NATS grants and streams for the tests
 ├── unit                       node:test, kit in-memory event store
-└── integration                MongoDB and NATS in Testcontainers
+├── integration                MongoDB and NATS in Testcontainers, fakes for the reads
+└── e2e                        the real sibling services (E2E_DIR), the ai-proxy mock
 ```
 
 No own migrations yet: orchestration has only the kit collections
-(ARCHITECTURE 7). An own index script goes in `src/migrations/NNN-name.ts`
+(`events`, `commands`, `counters`, `processed`; ARCHITECTURE 7). An own index script goes in `src/migrations/NNN-name.ts`
 and into the `runMigrations` list in `main.ts`.
 
 ## Coverage gates (ADR 0017)
@@ -44,10 +49,11 @@ for all included files together:
 
 ## Integration tests
 
-The NATS config in the test has the grants of the user
-`ai-systems-orchestration` and `ai-systems-admin` from gitops
-(`kubernetes/infrastructure/nats/values.yaml`). Change them together with
-gitops. Wait with `waitFor`, never with a fixed sleep. Pass
+`test/nats.ts` has the grants of the users from gitops
+(`kubernetes/infrastructure/nats/values.yaml`; orchestration as gitops
+#185 sets it). Change them together with gitops. `test/e2e` pins the
+commits of the sibling services; move them when a sibling changes a
+contract that orchestration uses. Wait with `waitFor`, never with a fixed sleep. Pass
 `drainDelayMs: 0` to `start()`. The restart test calls `start()` two times
 in one process, so `startTelemetry` runs two times. This is only in the
 tests.
