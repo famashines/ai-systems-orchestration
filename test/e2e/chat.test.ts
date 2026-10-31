@@ -51,6 +51,7 @@ function checkout(dir: string, name: string, sha: string): void {
   if (!existsSync(join(dir, ".git"))) {
     run("git", ["clone", "-q", `https://github.com/famashines/ai-systems-${name}.git`, dir], ".");
   }
+  run("git", ["fetch", "-q", "origin", sha], dir);
   run("git", ["-c", "advice.detachedHead=false", "checkout", "-q", sha], dir);
   if (!existsSync(join(dir, "node_modules"))) run("npm", ["ci", "--no-audit", "--no-fund"], dir);
 }

@@ -314,7 +314,7 @@ and an admin user that makes the streams.
   in place of conversation-hub and ai-proxy.
 - `test:e2e`: nothing of orchestration is faked. It clones budget,
   agent-manager, prompt-studio and ai-proxy at fixed `main` commits into
-  `E2E_DIR` (it reuses a clone that is there), runs `npm ci`, and starts
+  `E2E_DIR` (it reuses a clone that is there and fetches the commit), runs `npm ci`, and starts
   each as `node src/main.ts` on the host with its gitops NATS user. The
   seeds of agent-manager and prompt-studio give the writer. ai-proxy calls
   its own mock OpenRouter (`test/mock-openrouter.ts` of ai-proxy), which
