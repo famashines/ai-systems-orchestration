@@ -113,6 +113,8 @@ for (const [name, body, path] of [
   ["another command type", envelope({ type: "orchestration.CancelRun" }), "body.type"],
   ["an expectedVersion that is not 0", envelope({ expectedVersion: 3 }), "body.expectedVersion"],
   ["no actor", envelope({ actor: undefined }), "body.actor"],
+  ["an agent actor", envelope({ actor: { kind: "agent", id: "agent-1" } }), "body.actor.kind"],
+  ["a system actor", envelope({ actor: { kind: "system", id: "cron" } }), "body.actor.kind"],
 ] as const) {
   test(`SubmitTask with ${name} gives 400 problem JSON`, async () => {
     const response = await submit(body);
@@ -143,7 +145,20 @@ test("the replay API gives events in position order, in pages", async () => {
   assert.deepEqual(end.body.events, []);
 });
 
-for (const query of ["?limit=1001", "?limit=0", "?afterPosition=-1", "?afterPosition=x"]) {
+for (const query of [
+  "?limit=1001",
+  "?limit=0",
+  "?limit=",
+  "?limit=%2010",
+  "?limit=1e2",
+  "?limit=0x10",
+  "?limit=1.5",
+  "?afterPosition=-1",
+  "?afterPosition=-0",
+  "?afterPosition=x",
+  "?afterPosition=",
+  "?afterPosition=99999999999999999999",
+]) {
   test(`the replay API with ${query} gives 400`, async () => {
     assert.equal((await events(query)).status, 400);
   });
