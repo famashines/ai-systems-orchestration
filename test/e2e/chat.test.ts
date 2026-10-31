@@ -231,24 +231,35 @@ test(
 );
 
 test(
-  "with a monthly cap, the writer answer completes the run",
+  "a cap that is reached blocks the run; with room, the writer answer completes it",
   { skip: root === undefined },
   async () => {
     const budget = createEventStore(mongo.db.client.db("budget"));
-    await budget.append({
-      streamId: "budget-cap-month",
-      expectedVersion: 0,
-      events: [
-        {
-          type: "budget.BudgetSet",
-          schemaVersion: 1,
-          correlationId: randomUUID(),
-          causationId: randomUUID(),
-          actor: { kind: "owner", id: "owner-1" },
-          payload: { scope: { kind: "month" }, hardCapMicroUsd: 1_000_000 },
-        },
-      ],
-    });
+    const setCap = (hardCapMicroUsd: number, expectedVersion: number) =>
+      budget.append({
+        streamId: "budget-cap-month",
+        expectedVersion,
+        events: [
+          {
+            type: "budget.BudgetSet",
+            schemaVersion: 1,
+            correlationId: randomUUID(),
+            causationId: randomUUID(),
+            actor: { kind: "owner", id: "owner-1" },
+            payload: { scope: { kind: "month" }, hardCapMicroUsd },
+          },
+        ],
+      });
+    await setCap(1, 0);
+    const capped = await ended((await chat("Write a haiku about the sea.")).taskId);
+    assert.equal(capped.at(-1)?.type, "orchestration.RunBlocked");
+    assert.equal(capped.at(-1)?.payload.code, "budget_refused");
+    assert.equal(
+      capped.at(-1)?.payload.reason,
+      "The budget refused the call: The monthly cap has no room for this call",
+    );
+    assert.equal(mock.received.length, 0);
+    await setCap(1_000_000, 1);
     const { messageId, taskId } = await chat("Write a haiku about the sea.");
     const stream = await ended(taskId);
     assert.equal(stream.at(-1)?.type, "orchestration.RunCompleted");

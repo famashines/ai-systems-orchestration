@@ -1,14 +1,17 @@
 import type { RegisteredEvent } from "@famashines/ai-systems-contracts";
 import type { EventStore } from "@famashines/ai-systems-kit/event-store";
 import type { HandlerContext } from "@famashines/ai-systems-kit/messaging";
+import type { WarnLogger } from "../adapters/writer.ts";
 import {
   decide,
+  isClosed,
   evolve,
   initialState,
   taskStreamId,
   type LoadFailure,
   type TaskCommand,
   type TaskEvent,
+  type TaskState,
   type Writer,
 } from "../domain/task.ts";
 
@@ -17,6 +20,7 @@ export interface ChatDeps {
   newId: () => string;
   loadWriter: () => Promise<Writer | LoadFailure>;
   now: () => Date;
+  logger: WarnLogger;
 }
 
 const system = { kind: "system", id: "orchestration" } as const;
@@ -27,14 +31,14 @@ async function decideAndAppend(
   taskId: string,
   command: TaskCommand,
   { markProcessed }: HandlerContext,
-): Promise<void> {
+): Promise<TaskState> {
   const streamId = taskStreamId(taskId);
   const history = (await store.readStream(streamId)) as unknown as (TaskEvent & {
     occurredAt: string;
   })[];
   const state = history.reduce(evolve, initialState);
   const events = decide(state, command);
-  if (events.length === 0) return;
+  if (events.length === 0) return state;
   await store.append({
     streamId,
     expectedVersion: history.length,
@@ -46,6 +50,7 @@ async function decideAndAppend(
     })),
     also: markProcessed,
   });
+  return state;
 }
 
 export async function onOwnerMessage(
@@ -89,21 +94,21 @@ export async function onLlmEvent(
   event: RegisteredEvent,
   context: HandlerContext,
 ): Promise<void> {
-  if (event.type === "llm.CallCompleted") {
-    await decideAndAppend(
-      deps,
-      event,
-      event.payload.taskId,
-      { type: "CompleteCall", call: event.payload },
-      context,
-    );
-  } else if (event.type === "llm.CallFailed") {
-    await decideAndAppend(
-      deps,
-      event,
-      event.payload.taskId,
-      { type: "FailCall", call: event.payload },
-      context,
+  if (event.type !== "llm.CallCompleted" && event.type !== "llm.CallFailed") return;
+  const { taskId, callId, costMicroUsd } = event.payload;
+  const state = await decideAndAppend(
+    deps,
+    event,
+    taskId,
+    event.type === "llm.CallCompleted"
+      ? { type: "CompleteCall", call: event.payload }
+      : { type: "FailCall", call: event.payload },
+    context,
+  );
+  if (isClosed(state)) {
+    deps.logger.warn(
+      { taskId, callId, costMicroUsd, type: event.type },
+      "a late call event for a closed task is dropped",
     );
   }
 }

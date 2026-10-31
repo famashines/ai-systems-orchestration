@@ -487,3 +487,17 @@ test("no active writer version fails the run with not_found", async () => {
     agentAnswer = [200, writerAgent];
   }
 });
+
+test("agent-manager with 5xx after the retries fails the run with unavailable and a reply", async () => {
+  agentAnswer = [503, { code: "unavailable" }];
+  try {
+    const messageId = randomUUID();
+    await post({ messageId, intent: "new_task" });
+    const taskId = await taskOf(messageId);
+    const events = await until(taskId, "orchestration.RunFailed");
+    assert.equal(events.at(-1)?.payload.code, "unavailable");
+    assert.match(String(events.at(-1)?.payload.reason), /Try again in a minute\.$/);
+  } finally {
+    agentAnswer = [200, writerAgent];
+  }
+});

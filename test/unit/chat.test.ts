@@ -53,9 +53,16 @@ const context = () => {
   return { value, marked };
 };
 
+const warnings: { details: object; message: string }[] = [];
+const logger = {
+  warn: (details: object, message: string) => {
+    warnings.push({ details, message });
+  },
+};
+
 const setup = (loadWriter: ChatDeps["loadWriter"] = () => Promise.resolve(writer)) => {
   const store = createMemoryEventStore({ newId: fakeIds(1) });
-  const deps: ChatDeps = { store, newId: fakeIds(2), loadWriter, now: () => new Date() };
+  const deps: ChatDeps = { store, newId: fakeIds(2), loadWriter, now: () => new Date(), logger };
   return { store, deps };
 };
 
@@ -139,8 +146,15 @@ test("a CallCompleted of the task ends the run; a CallStarted gives nothing", as
     type: "llm.CallFailed",
     payload: { ...attempt, errorClass: "provider", reason: "HTTP 500", costMicroUsd: 0 },
   } as RegisteredEvent;
+  warnings.length = 0;
   await onLlmEvent(deps, failedCall, value);
   assert.equal((await store.readStream(`task-${taskId}`)).length, 4);
+  assert.deepEqual(warnings, [
+    {
+      details: { taskId, callId, costMicroUsd: 0, type: "llm.CallFailed" },
+      message: "a late call event for a closed task is dropped",
+    },
+  ]);
 });
 
 test("a steer for a running task gives MessageRefused on the task stream", async () => {
@@ -154,10 +168,28 @@ test("a steer for a running task gives MessageRefused on the task stream", async
   assert.equal(stream.at(-1)?.actor.kind, "system");
 });
 
-test("a transient load failure throws, so the kit consumer retries, and writes nothing", async () => {
-  const { store, deps } = setup(() => Promise.reject(new ReadFailedError("x", "HTTP 503")));
-  await assert.rejects(onOwnerMessage(deps, posted({ intent: "new_task" }), context().value));
-  assert.equal((await store.readAll()).length, 0);
+test("a dependency outage after the retries gives TaskSubmitted and RunFailed unavailable", async (t) => {
+  const server = await serve({ [agentPath]: [503, {}] });
+  t.after(server.close);
+  const { store, deps } = setup(
+    writerLoader({
+      agentManagerUrl: server.url,
+      promptStudioUrl: server.url,
+      logger,
+      retryDelaysMs: [1, 1],
+    }),
+  );
+  await onOwnerMessage(deps, posted({ intent: "new_task" }), context().value);
+  assert.equal(server.requests(), 3);
+  const events = await store.readAll();
+  assert.deepEqual(
+    events.map((event) => event.type),
+    ["orchestration.TaskSubmitted", "orchestration.RunStarted", "orchestration.RunFailed"],
+  );
+  const failed = events[2];
+  assert.equal(failed?.type, "orchestration.RunFailed");
+  assert.equal(failed.payload.code, "unavailable");
+  assert.match(failed.payload.reason, /Try again/);
 });
 
 test("other event types give nothing", async () => {
@@ -168,14 +200,20 @@ test("other event types give nothing", async () => {
 });
 
 const serve = async (routes: Record<string, [number, unknown]>) => {
+  let requests = 0;
   const server = createServer((request, response) => {
+    requests += 1;
     const [status, body] = routes[request.url ?? ""] ?? [404, {}];
     response.writeHead(status, { "content-type": "application/json" });
     response.end(typeof body === "string" ? body : JSON.stringify(body));
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const url = `http://127.0.0.1:${String((server.address() as AddressInfo).port)}`;
-  return { url, close: () => new Promise((resolve) => server.close(resolve)) };
+  return {
+    url,
+    requests: () => requests,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
 };
 
 const agentPath = "/internal/agents/by-name/writer/active-version";
@@ -205,24 +243,45 @@ test("writerLoader reads the active writer version and its prompt version", asyn
   for (const [routes, expected] of cases) {
     const server = await serve(routes);
     t.after(server.close);
-    const load = writerLoader({ agentManagerUrl: server.url, promptStudioUrl: server.url });
+    const load = writerLoader({ agentManagerUrl: server.url, promptStudioUrl: server.url, logger });
     assert.deepEqual(await load(), expected);
   }
 });
 
-test("writerLoader throws on a 5xx or a network error", async (t) => {
-  const server = await serve({ [agentPath]: [503, {}] });
+test("writerLoader tries a 5xx or a network error 3 times, then gives unavailable with the cause logged", async (t) => {
+  const server = await serve({ [agentPath]: [200, writer.agent], [promptPath]: [502, {}] });
   t.after(server.close);
-  await assert.rejects(
-    writerLoader({ agentManagerUrl: server.url, promptStudioUrl: server.url })(),
-    /HTTP 503/,
+  const retryDelaysMs = [1, 1];
+  const unavailable = {
+    code: "unavailable",
+    reason:
+      "agent-manager or prompt-studio did not answer, so the writer agent could not start. Try again in a minute.",
+  };
+  assert.deepEqual(
+    await writerLoader({
+      agentManagerUrl: server.url,
+      promptStudioUrl: server.url,
+      logger,
+      retryDelaysMs,
+    })(),
+    unavailable,
   );
-  await assert.rejects(
-    writerLoader({
+  assert.equal(server.requests(), 4);
+  warnings.length = 0;
+  assert.deepEqual(
+    await writerLoader({
       agentManagerUrl: "http://127.0.0.1:1",
       promptStudioUrl: server.url,
+      logger,
       timeoutMs: 500,
+      retryDelaysMs,
     })(),
-    ReadFailedError,
+    unavailable,
   );
+  const [warning] = warnings;
+  assert.equal(warning?.message, "the writer read failed");
+  const { err, attempts } = warning.details as { err: Error; attempts: number };
+  assert.equal(attempts, 3);
+  assert.ok(err instanceof ReadFailedError);
+  assert.ok(err.cause instanceof Error);
 });

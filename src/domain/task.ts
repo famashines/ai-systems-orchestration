@@ -19,6 +19,8 @@ import type {
 
 export const callDurationMs = 120_000;
 export const staleAfterMs = 15 * 60_000;
+export const staleReason =
+  "The answer did not come in 15 minutes, so the task stopped. A later answer is not shown, and its cost is still booked.";
 
 export interface Writer {
   agent: ActiveAgentVersionResultV1;
@@ -236,7 +238,7 @@ function refuseMessage(state: TaskState, command: RefuseMessage): TaskEvent[] {
         taskId,
         runId: state.runId,
         code: "unavailable",
-        reason: "The answer did not come in 15 minutes, so the task stopped.",
+        reason: staleReason,
       },
     });
     current = { status: "failed" };
@@ -254,6 +256,9 @@ function refuseMessage(state: TaskState, command: RefuseMessage): TaskEvent[] {
   });
   return events;
 }
+
+export const isClosed = (state: TaskState): boolean =>
+  state.status === "completed" || state.status === "failed" || state.status === "blocked";
 
 const isCurrent = (state: TaskState, callId: string): state is TaskState & { runId: string } =>
   state.status === "running" && state.callId === callId && state.runId !== undefined;

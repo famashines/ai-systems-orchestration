@@ -68,7 +68,9 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
     store,
     newId: randomUUID,
     now: () => new Date(),
+    logger,
     loadWriter: writerLoader({
+      logger,
       agentManagerUrl: config.AGENT_MANAGER_URL,
       promptStudioUrl: config.PROMPT_STUDIO_URL,
     }),

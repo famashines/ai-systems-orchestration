@@ -8,6 +8,7 @@ import {
   evolve,
   initialState,
   nextCall,
+  staleReason,
   TaskExistsError,
   taskStreamId,
   type TaskCommand,
@@ -305,11 +306,19 @@ test("given a running call, when a steer comes, then MessageRefused", () => {
   ]);
 });
 
-test("given a call older than 15 minutes, when a steer comes, then RunFailed and MessageRefused", () => {
+test("given a call older than 15 minutes, when a steer or an answer comes, then RunFailed and MessageRefused", () => {
+  const reason =
+    "The answer did not come in 15 minutes, so the task stopped. A later answer is not shown, and its cost is still booked.";
+  assert.equal(staleReason, reason);
   assert.deepEqual(given(running).when(refuse("steer", minutes(16)))(), [
-    runFailed("unavailable", "The answer did not come in 15 minutes, so the task stopped."),
+    runFailed("unavailable", reason),
     refused("steer", "The task has ended. Send the message as a new task."),
   ]);
+  assert.deepEqual(given(running).when(refuse("answer", minutes(16)))(), [
+    runFailed("unavailable", reason),
+    refused("answer", "The task has no open question."),
+  ]);
+  assert.deepEqual(given(running).when(refuse("steer", minutes(15)))().length, 1);
 });
 
 test("given a blocked task, when a steer comes, then MessageRefused with the block reason", () => {

@@ -59,16 +59,16 @@ OwnerMessagePosted{intent: new_task}
       TaskSubmitted{mode: auto, conversationId, messageId}, RunStarted, CallRequested
 ```
 
-| Case                                                                        | Events after `TaskSubmitted`, `RunStarted`                                              |
-| --------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
-| The writer and its prompt load                                              | `CallRequested`                                                                         |
-| agent-manager gives 404 (no active version)                                 | `RunFailed` `not_found`                                                                 |
-| prompt-studio gives 404                                                     | `RunFailed` `not_found`                                                                 |
-| A body that is not valid, or a prompt version that is not the one asked for | `RunFailed` `internal`                                                                  |
-| The agent has `enabled: false`                                              | `RunFailed` `unavailable`                                                               |
-| The prompt version has variables                                            | `RunFailed` `internal` (M2 has no values to fill them)                                  |
-| A runaway rule (below) stops the call                                       | `RunBlocked` `runaway_stopped`                                                          |
-| A network error, a timeout (5 s) or a 5xx                                   | nothing: the handler throws and the kit consumer tries again (5 deliveries, then `DLQ`) |
+| Case                                                                        | Events after `TaskSubmitted`, `RunStarted`                                                                                                     |
+| --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| The writer and its prompt load                                              | `CallRequested`                                                                                                                                |
+| agent-manager gives 404 (no active version)                                 | `RunFailed` `not_found`                                                                                                                        |
+| prompt-studio gives 404                                                     | `RunFailed` `not_found`                                                                                                                        |
+| A body that is not valid, or a prompt version that is not the one asked for | `RunFailed` `internal`                                                                                                                         |
+| The agent has `enabled: false`                                              | `RunFailed` `unavailable`                                                                                                                      |
+| The prompt version has variables                                            | `RunFailed` `internal` (M2 has no values to fill them)                                                                                         |
+| A runaway rule (below) stops the call                                       | `RunBlocked` `runaway_stopped`                                                                                                                 |
+| A network error, a timeout (2 s) or a 5xx, 3 times in about 10 s            | `RunFailed` `unavailable`, reason `agent-manager or prompt-studio did not answer, so the writer agent could not start. Try again in a minute.` |
 
 `CallRequested`:
 
@@ -125,8 +125,13 @@ There is no retry by orchestration in M2: the last `CallFailed` of a call
 ends the run. ai-proxy has already tried the model chain.
 
 Each chat task ends with `RunCompleted` or `RunFailed`, or waits with
-`RunBlocked`, so conversation-hub never keeps a task that runs for ever.
-A reason is cut to 1000 characters.
+`RunBlocked`, when its call ends. A call that does not end keeps the task
+`running` until the stale rule below stops it. A reason is cut to 1000
+characters.
+
+A `CallCompleted` or `CallFailed` for a task that is completed, failed or
+blocked gives no event, and a warn log `a late call event for a closed
+task is dropped` with `taskId`, `callId` and `costMicroUsd`.
 
 ### `steer` and `answer`
 
@@ -148,11 +153,12 @@ the reason as a reply:
 A refusal does not change the task state. A blocked task stays blocked
 in M2: there is no resume yet.
 
-A steer for a running task whose `CallRequested` is older than 15 minutes
-(`staleAfterMs`) first gives `RunFailed` `unavailable` (`The answer did
-not come in 15 minutes, so the task stopped.`), then the refusal. So a
-call that never ends (for example a call that ai-proxy sent to its
-`DLQ`) does not keep the task running.
+A steer or an answer for a running task whose `CallRequested` is older
+than 15 minutes (`staleAfterMs`) first gives `RunFailed` `unavailable`
+(`The answer did not come in 15 minutes, so the task stopped. A later
+answer is not shown, and its cost is still booked.`), then the refusal.
+So a call that never ends (for example a call that ai-proxy sent to its
+`DLQ`) does not keep the task running when the owner writes to it.
 
 ## API
 
@@ -323,9 +329,10 @@ and an admin user that makes the streams.
   the host, not in containers. The test adds the three seed models to the
   mock catalog. The test publishes `conversation.OwnerMessagePosted` in
   place of conversation-hub. No cap: budget refuses, and the run is
-  blocked. Then the test appends `budget.BudgetSet` (1 USD) to the budget
-  database, because the budget command needs an owner JWT; the next run
-  completes with the mock answer. With no `E2E_DIR`, the tests are
+  blocked. Then the test appends `budget.BudgetSet` to the budget
+  database, because the budget command needs an owner JWT: a cap of 1
+  micro-USD (the cap is reached, the run is blocked), then 1 USD (the
+  next run completes with the mock answer). With no `E2E_DIR`, the tests are
   skipped. The CI job `e2e` sets it.
 
 Commands for agents: `CLAUDE.md`.
@@ -336,16 +343,18 @@ Commands for agents: `CLAUDE.md`.
   after the last `CallFailed` (ARCHITECTURE 8.2 has 3 tries with backoff;
   that needs a timer, M3). The runaway rules see one call only.
 - `RunCompleted.costMicroUsd` is the cost of the attempt that gave the
-  answer. The cost of earlier attempts of the same call (ai-proxy fallback
-  chain) is in their `llm.CallFailed` events and in the budget, not in
-  this number.
+  answer. The cost of the task is the sum of the `llm.*` costs (earlier
+  attempts of the ai-proxy fallback chain are in their `llm.CallFailed`
+  events); projections sums them.
 - A steer or an answer is always refused (no contract event to record it
   in v0.3.0). A blocked task stays blocked: there is no resume in M2.
-- When agent-manager or prompt-studio does not answer for about 2.5
-  minutes (5 deliveries), the message goes to `dlq.orchestration.*` with
-  no task and no reply. A DLQ replay starts the task.
-- A call with no end is stopped only when a steer comes for its task
-  after 15 minutes. There is no timer.
+- When agent-manager or prompt-studio does not answer 3 times in about
+  10 s, the run fails with `unavailable`. The owner sends the message
+  again. The ordered `CONVERSATION` consumer waits for those 10 s.
+- A call with no end is stopped only when a steer or an answer comes for
+  its task after 15 minutes. There is no timer. When the answer comes
+  after that stop, it is lost: the owner does not see it, and ai-proxy
+  and the budget have booked its cost. The warn log shows it.
 - Tasks of `POST /internal/commands/submit-task` (the API path) do not
   run in M2: they stay `submitted`. conversation-hub ignores them.
 - The kit consumer starts at the first message of the stream
