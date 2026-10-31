@@ -48,7 +48,9 @@ The NATS config in the test has the grants of the user
 `ai-systems-orchestration` and `ai-systems-admin` from gitops
 (`kubernetes/infrastructure/nats/values.yaml`). Change them together with
 gitops. Wait with `waitFor`, never with a fixed sleep. Pass
-`drainDelayMs: 0` to `start()`.
+`drainDelayMs: 0` to `start()`. The restart test calls `start()` two times
+in one process, so `startTelemetry` runs two times. This is only in the
+tests.
 
 The CI job `integration` runs on `ubuntu-22.04`: `mongo:8.0.34` does not
 start on the kernel of `ubuntu-24.04`. See the kit `CLAUDE.md`.
