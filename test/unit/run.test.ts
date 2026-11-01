@@ -604,7 +604,7 @@ test("a done subtask queues its dependents; a dependent with needsApproval opens
   assert.equal(statusOf(fold(initialState, history), C), "awaiting_approval");
 });
 
-test("an approved checkpoint starts the subtask; when all are done, RunCompleted has the outputs in plan order", () => {
+test("an approved checkpoint starts the subtask; with no orchestrator agent loaded, RunCompleted has the outputs in plan order", () => {
   const run = started().history;
   const first = handle(run, done(callOf(run, A), "Facts."));
   const checkpointId = find(first.events, "orchestration.CheckpointOpened").checkpointId;

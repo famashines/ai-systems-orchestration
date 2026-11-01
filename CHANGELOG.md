@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- Orchestrator agent (task M3-03): a chat `new_task` is a planned task.
+  `TaskSubmitted` has the `mode` of the message (absent: `approval`), and
+  the active `orchestrator` agent gets a plan call (`kind` `plan`). Its
+  answer is strict JSON: 1 to 5 questions (`ClarificationRequested`, then
+  the owner `answer` gives `ClarificationAnswered` and a new plan call;
+  one round, only for a task with a `conversationId`) or 1 to 20
+  subtasks. The plan checks in code: agent names in `PLAN_AGENTS`
+  (default `writer`) with an active and enabled version, a model of that
+  agent, `PlanSubtasks` (DAG), the call limits, and the estimates
+  (allowance over calls of each agent) inside the rest of the
+  orchestrator allowance. A refused answer gets one more plan call with
+  the reason, then `RunFailed` `validation_failed`. A plan call refused by
+  the budget gives `RunFailed` `budget_refused`. Mode `approval` gives
+  `PlanProposed` with `awaitsApproval` true; mode `auto` gives
+  `PlanProposed`, `PlanApproved` (actor `system`) and the run.
+- End of a run: an aggregate call (`kind` `aggregate`) writes the final
+  answer from the outputs (`subtask_output` blocks), a check call
+  (`kind` `check`) checks it against the request, and a failed check
+  sends one subtask back once (its earlier output and the feedback in a
+  `quality_check` block). `RunCompleted` has the final answer and the
+  cost of the aggregate call. When the aggregate call fails, the summary
+  is the outputs in plan order.
+- All calls of a new chat task have a `kind`, so each gets `CallSettled`.
+- Review changes: a step goes back only when the redo agent and the
+  orchestrator have a call left, the task has 2 calls left, and the money
+  left covers both estimates; else the run completes with the answer. The
+  plan check counts 4 end calls and keeps money for one rework.
+  `checkPlan` (exported for `EditPlan` and `ReassignSubtask`) has the
+  checks of a plan of agent ids, and it refuses an agent whose prompt has
+  variables, a title with a line break, and a line that starts with
+  `BEGIN DATA ` or `END DATA `. Refusal reasons count subtasks from 1. An
+  `unavailable` read of agent-manager after the plan call settles throws,
+  so NATS sends the event again. The plan call tells the most subtasks
+  that fit. A failure before the run is `RunFailed` with no `RunStarted`.
+  New chat tasks have no 15-minute stale rule (`calledAt` is only for a
+  call with no `kind`).
+- Subtask calls get the answers to the questions as `owner_message`
+  blocks. `writerLoader` is now `agentByNameLoader`. Injection fixture
+  tests for the owner text, the planner answer, subtask outputs and the
+  check feedback.
+
 - Run process manager and Task aggregate (task M3-02), contracts v0.4.1:
   all task and subtask states of the status table, `StartRun` from an
   approved plan, DAG scheduling with at most `MAX_PARALLEL_SUBTASKS`

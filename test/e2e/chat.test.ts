@@ -25,7 +25,7 @@ const root = process.env.E2E_DIR;
 
 const siblings = [
   { name: "budget", sha: "da183d31292ca99a01b94218bb1259f41a0a78a3" },
-  { name: "agent-manager", sha: "f4e5ef4bf5681450482d796443043da34b3587be" },
+  { name: "agent-manager", sha: "5193a1efa0d1b3d6725a2356e623c35441ccab00" },
   { name: "prompt-studio", sha: "bd614ed46d8c10c687a8f361158a4a74e17fe5b0" },
   { name: "ai-proxy", sha: "26d963f900460347ae13a05ec875cef821e4172b" },
 ] as const;
@@ -40,8 +40,11 @@ interface MockOpenRouter {
   url: string;
   received: { body: { model: string; messages: unknown } }[];
   models: unknown[];
+  reply(model: string, ...replies: unknown[]): void;
   close(): Promise<void>;
 }
+
+let streamOf: (model: string, pieces: string[]) => unknown;
 
 const run = (command: string, args: string[], cwd: string): void => {
   execFileSync(command, args, { cwd, stdio: "inherit" });
@@ -122,8 +125,10 @@ before(
     await createStreams(admin.connection, streams);
     const mockModule = (await import(join(root, "ai-proxy", "test", "mock-openrouter.ts"))) as {
       startMockOpenRouter: (port?: number) => Promise<MockOpenRouter>;
+      streamOf: typeof streamOf;
     };
     mock = await mockModule.startMockOpenRouter(0);
+    streamOf = mockModule.streamOf;
     mock.models.push(
       ...seedModels.map((id) => ({
         id,
@@ -171,7 +176,10 @@ type Stored = { type: string; streamId: string; payload: Record<string, unknown>
 const events = () => mongo.db.collection<Stored>("events");
 const conversationId = randomUUID();
 
-async function chat(text: string): Promise<{ messageId: string; taskId: string }> {
+async function chat(
+  text: string,
+  mode: "auto" | "approval" = "auto",
+): Promise<{ messageId: string; taskId: string }> {
   const messageId = randomUUID();
   const eventId = randomUUID();
   await jetstream(admin.connection).publish(
@@ -186,7 +194,7 @@ async function chat(text: string): Promise<{ messageId: string; taskId: string }
       correlationId: messageId,
       causationId: randomUUID(),
       actor: { kind: "owner", id: "owner-1" },
-      payload: { conversationId, messageId, text, intent: "new_task" },
+      payload: { conversationId, messageId, text, intent: "new_task", mode },
     }),
     { msgID: eventId },
   );
@@ -210,7 +218,7 @@ const ended = async (taskId: string): Promise<Stored[]> => {
 };
 
 test(
-  "with no monthly cap, the budget refuses the call and the run is blocked",
+  "with no monthly cap, the budget refuses the plan call and the task fails",
   { skip: root === undefined },
   async () => {
     const { taskId } = await chat("Write a haiku about the sea.");
@@ -219,19 +227,23 @@ test(
       stream.map((event) => event.type),
       [
         "orchestration.TaskSubmitted",
-        "orchestration.RunStarted",
         "orchestration.CallRequested",
-        "orchestration.RunBlocked",
+        "orchestration.CallSettled",
+        "orchestration.RunFailed",
       ],
     );
+    assert.equal(stream[1]?.payload.kind, "plan");
     assert.equal(stream[3]?.payload.code, "budget_refused");
-    assert.equal(stream[3].payload.reason, "The budget refused the call: No monthly cap is set");
+    assert.equal(
+      stream[3].payload.reason,
+      "The budget refused the plan call: No monthly cap is set",
+    );
     assert.equal(mock.received.length, 0);
   },
 );
 
 test(
-  "a cap that is reached blocks the run; with room, the writer answer completes it",
+  "a cap that is reached fails the plan call; with room, the orchestrator plans, the writer answers, and the run completes",
   { skip: root === undefined },
   async () => {
     const budget = createEventStore(mongo.db.client.db("budget"));
@@ -252,30 +264,51 @@ test(
       });
     await setCap(1, 0);
     const capped = await ended((await chat("Write a haiku about the sea.")).taskId);
-    assert.equal(capped.at(-1)?.type, "orchestration.RunBlocked");
+    assert.equal(capped.at(-1)?.type, "orchestration.RunFailed");
     assert.equal(capped.at(-1)?.payload.code, "budget_refused");
     assert.equal(
       capped.at(-1)?.payload.reason,
-      "The budget refused the call: The monthly cap has no room for this call",
+      "The budget refused the plan call: The monthly cap has no room for this call",
     );
     assert.equal(mock.received.length, 0);
     await setCap(1_000_000, 1);
+    const [first] = seedModels;
+    const plan = JSON.stringify({
+      subtasks: [{ title: "Haiku", instructions: "Write a haiku about the sea.", agent: "writer" }],
+    });
+    mock.reply(
+      first ?? "",
+      streamOf(first ?? "", [plan]),
+      streamOf(first ?? "", ["Waves fold into foam."]),
+      streamOf(first ?? "", ["The haiku (step 1): Waves fold into foam."]),
+      streamOf(first ?? "", ['{"pass": true}']),
+    );
     const { messageId, taskId } = await chat("Write a haiku about the sea.");
     const stream = await ended(taskId);
     assert.equal(stream.at(-1)?.type, "orchestration.RunCompleted");
-    assert.equal(stream.at(-1)?.payload.summary, "Mock answer.");
+    assert.equal(stream.at(-1)?.payload.summary, "The haiku (step 1): Waves fold into foam.");
     assert.equal(stream.at(-1)?.payload.costMicroUsd, 42);
-    assert.equal(stream[2]?.payload.maxCostMicroUsd, 50_000);
-    const [request] = mock.received;
-    assert.equal(request?.body.model, "google/gemini-2.5-flash-lite");
-    const messages = request.body.messages as { role: string; content: string }[];
-    assert.equal(messages[0]?.role, "system");
-    assert.match(messages[0].content, /^You are the writer agent\./);
-    const blockId = /BEGIN DATA owner_message (\S+)\n/.exec(messages[1]?.content ?? "")?.[1];
-    assert.ok(blockId !== undefined && blockId !== messageId);
-    assert.equal(
-      messages[1]?.content,
-      `Answer the owner's chat message. It is in the data block below.\nBEGIN DATA owner_message ${blockId}\nWrite a haiku about the sea.\nEND DATA owner_message ${blockId}`,
+    const calls = stream.filter((event) => event.type === "orchestration.CallRequested");
+    assert.deepEqual(
+      calls.map((event) => event.payload.kind),
+      ["plan", "subtask", "aggregate", "check"],
     );
+    assert.equal(calls[0]?.payload.maxCostMicroUsd, 50_000);
+    assert.equal(stream.filter((event) => event.type === "orchestration.CallSettled").length, 4);
+    assert.equal(mock.received.length, 4);
+    const [planRequest, subtaskRequest] = mock.received;
+    assert.equal(planRequest?.body.model, first);
+    const planMessages = planRequest?.body.messages as { role: string; content: string }[];
+    assert.match(planMessages[0]?.content ?? "", /^You are the orchestrator/);
+    const blockId = /BEGIN DATA owner_message (\S+)\n/.exec(planMessages[1]?.content ?? "")?.[1];
+    assert.ok(blockId !== undefined && blockId !== messageId);
+    assert.ok(
+      planMessages[1]?.content.endsWith(
+        `BEGIN DATA owner_message ${blockId}\nWrite a haiku about the sea.\nEND DATA owner_message ${blockId}`,
+      ),
+    );
+    const subtaskMessages = subtaskRequest?.body.messages as { content: string }[];
+    assert.match(subtaskMessages[0]?.content ?? "", /^You are the writer agent\./);
+    assert.match(subtaskMessages[1]?.content ?? "", /\nThe step: Haiku\n/);
   },
 );
