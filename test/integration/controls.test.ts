@@ -18,6 +18,7 @@ import {
   type Started,
 } from "@famashines/ai-systems-kit/testing";
 import { exportJWK, generateKeyPair, SignJWT, type CryptoKey } from "jose";
+import { commandPath } from "../../src/adapters/http.ts";
 import { envSchema, start } from "../../src/main.ts";
 import { natsConfig, password, streams } from "../nats.ts";
 
@@ -117,8 +118,6 @@ const token = (roles = ["owner"], sub = ownerId) =>
     .setExpirationTime("5m")
     .sign(privateKey);
 
-const kebab = (name: string) => name.replace(/(?<!^)[A-Z]/g, "-$&").toLowerCase();
-
 interface Sent {
   status: number;
   body: Record<string, unknown>;
@@ -132,7 +131,7 @@ async function send(
 ): Promise<Sent> {
   const commandId = options.commandId ?? randomUUID();
   const auth = options.auth === undefined ? `Bearer ${await token()}` : options.auth;
-  const response = await fetch(`${base}/internal/commands/${kebab(name)}`, {
+  const response = await fetch(`${base}${commandPath(name)}`, {
     method: "POST",
     headers: {
       "content-type": "application/json",

@@ -664,6 +664,13 @@ Commands for agents: `CLAUDE.md`.
   moves chat tasks to planned runs.
 - A planned run starts only from a plan, and only the planner (M3-03)
   makes a plan. The owner routes are ready for it.
+- The replay of an owner command looks only in the stream of its task.
+  A `commandId` that was used for another task gives 409, or the first
+  answer with the other `taskId` (api-gateway then gives 502). Use a new
+  key for each command.
+- An owner command and a consumer event that append to the same task at
+  the same time give 409 `conflict` for the command (a `ConcurrencyError`).
+  The route does not try again. Send the command again with a new key.
 - On the cluster the owner routes need `OIDC_JWKS_URL` (the Keycloak
   service) and a NetworkPolicy egress from orchestration to Keycloak on
   port 8080, the same as budget.
