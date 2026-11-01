@@ -8,7 +8,7 @@ import { createMemoryEventStore, fakeIds } from "@famashines/ai-systems-kit/test
 import { agentByIdLoader, agentByNameLoader, ReadFailedError } from "../../src/adapters/writer.ts";
 import { onTimer, type TaskDeps } from "../../src/application/run.ts";
 import { onLlmEvent, onOwnerMessage } from "../../src/application/chat.ts";
-import type { Writer } from "../../src/domain/task.ts";
+import { AgentUnavailableError, type Writer } from "../../src/domain/task.ts";
 
 const promptId = "cc74090a-534e-4072-8bfd-e6c5b9f22f41";
 const writer: Writer = {
@@ -239,6 +239,23 @@ test("auto mode: the run plans, runs the subtask, aggregates, checks and complet
   assert.equal(end?.type, "orchestration.RunCompleted");
   assert.equal(end.payload.summary, "The answer (step 1): The sea is wide.");
   assert.equal(end.payload.costMicroUsd, 7);
+});
+
+test("an agent-manager outage when the plan answer comes rejects the event and appends nothing", async () => {
+  const outage = (name: string) =>
+    name === "writer"
+      ? Promise.resolve({ code: "unavailable" as const, reason: "No answer." })
+      : byName(name);
+  const { store, deps } = setup(outage);
+  const { taskId } = await newTask(deps, store);
+  const call = await lastCall(store, taskId);
+  const { value, marked } = context();
+  await assert.rejects(
+    onLlmEvent(deps, answer(taskId, call.payload.callId, onePlan), value),
+    AgentUnavailableError,
+  );
+  assert.equal(marked.length, 0);
+  assert.deepEqual(await typesOf(store, taskId), ["TaskSubmitted", "CallRequested"]);
 });
 
 test("clarify: questions give ClarificationRequested, and the answer gives a new plan call", async () => {

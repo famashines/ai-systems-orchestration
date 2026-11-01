@@ -12,6 +12,7 @@ import {
 } from "@famashines/ai-systems-contracts";
 import { z } from "zod";
 import {
+  estimate,
   failedCodes,
   fold,
   isRunActive,
@@ -173,10 +174,11 @@ export function agentsToLoad(state: TaskState, env: Pick<RunEnv, "now" | "settin
   if (state.status !== "running" || state.runId === undefined) return [];
   if (allDone(state)) {
     const next = finalStep(state);
-    if ("call" in next && state.orchestratorId !== undefined) return [state.orchestratorId];
+    const orchestrator = state.orchestratorId === undefined ? [] : [state.orchestratorId];
+    if ("call" in next) return orchestrator;
     const redo =
       "rework" in next ? planned(state).find((item) => item.subtaskId === next.rework) : undefined;
-    return redo === undefined ? [] : [redo.agentId];
+    return redo === undefined ? [] : [...new Set([redo.agentId, ...orchestrator])];
   }
   const free = env.settings.maxParallel - busyCount(state);
   const ids = planned(state)
@@ -294,7 +296,7 @@ interface CallSpec {
   subtaskId?: string;
   models?: string[] | undefined;
   slots: number;
-  messages: (prompt: Writer["prompt"]) => CallMessage[];
+  messages: (prompt: Writer["prompt"], agent: Writer["agent"]) => CallMessage[];
 }
 
 export function prepareCall(
@@ -340,7 +342,7 @@ export function prepareCall(
     callId: env.newId(),
     agentId: agent.agentId,
     agentVersion: agent.version,
-    messages: spec.messages(prompt),
+    messages: spec.messages(prompt, agent),
     models: spec.models ?? agent.models,
     maxTokens: agent.limits.maxTokens,
     maxDurationMs: callDurationMs,
@@ -499,6 +501,27 @@ function checkMessages(
   ];
 }
 
+function roomForRework(state: TaskState, subtaskId: string, env: RunEnv): boolean {
+  const redo = planned(state).find((item) => item.subtaskId === subtaskId);
+  const redoLoad = redo === undefined ? undefined : env.agents.get(redo.agentId);
+  const orchestrator =
+    state.orchestratorId === undefined ? undefined : env.agents.get(state.orchestratorId);
+  if (redoLoad === undefined || !("agent" in redoLoad)) return false;
+  if (orchestrator === undefined || !("agent" in orchestrator)) return false;
+  const calls = Object.values(state.calls);
+  if (calls.length + 2 > env.settings.maxCallsPerTask) return false;
+  const same = redoLoad.agent.agentId === orchestrator.agent.agentId ? 1 : 0;
+  const stopped = ({ agent }: Writer) =>
+    "stop" in
+    nextCall(agent.limits, {
+      calls: calls.filter((call) => call.agentId === agent.agentId).length + same,
+      costMicroUsd: state.costMicroUsd,
+    });
+  if (stopped(redoLoad) || stopped(orchestrator)) return false;
+  const rest = orchestrator.agent.limits.maxCostMicroUsd - state.costMicroUsd;
+  return rest >= estimate(redoLoad.agent.limits) + estimate(orchestrator.agent.limits);
+}
+
 export function completeRun(state: TaskState, env: RunEnv): TaskEvent[] {
   const ids = runIds(state);
   const completed = (done: { summary: string; costMicroUsd: number }) => [
@@ -511,7 +534,12 @@ export function completeRun(state: TaskState, env: RunEnv): TaskEvent[] {
   const next = finalStep(state);
   if ("wait" in next) return [];
   if ("rework" in next) {
-    return [event("orchestration.SubtaskQueued", { ...ids, subtaskId: next.rework })];
+    return roomForRework(state, next.rework, env)
+      ? [event("orchestration.SubtaskQueued", { ...ids, subtaskId: next.rework })]
+      : completed({
+          summary: state.answer?.text ?? "",
+          costMicroUsd: state.answer?.costMicroUsd ?? 0,
+        });
   }
   if ("done" in next) return completed(next.done);
   if (state.status !== "running") return [];

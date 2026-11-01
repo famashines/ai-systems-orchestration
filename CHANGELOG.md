@@ -25,6 +25,19 @@
   cost of the aggregate call. When the aggregate call fails, the summary
   is the outputs in plan order.
 - All calls of a new chat task have a `kind`, so each gets `CallSettled`.
+- Review changes: a step goes back only when the redo agent and the
+  orchestrator have a call left, the task has 2 calls left, and the money
+  left covers both estimates; else the run completes with the answer. The
+  plan check counts 4 end calls and keeps money for one rework.
+  `checkPlan` (exported for `EditPlan` and `ReassignSubtask`) has the
+  checks of a plan of agent ids, and it refuses an agent whose prompt has
+  variables, a title with a line break, and a line that starts with
+  `BEGIN DATA ` or `END DATA `. Refusal reasons count subtasks from 1. An
+  `unavailable` read of agent-manager after the plan call settles throws,
+  so NATS sends the event again. The plan call tells the most subtasks
+  that fit. A failure before the run is `RunFailed` with no `RunStarted`.
+  New chat tasks have no 15-minute stale rule (`calledAt` is only for a
+  call with no `kind`).
 - Subtask calls get the answers to the questions as `owner_message`
   blocks. `writerLoader` is now `agentByNameLoader`. Injection fixture
   tests for the owner text, the planner answer, subtask outputs and the

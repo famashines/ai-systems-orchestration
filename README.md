@@ -82,9 +82,11 @@ OwnerMessagePosted{intent: new_task}
 | Another 4xx (400, 401, 403, 429 ...), with no retry                         | `RunFailed` `internal`                                                                                                                               |
 | A network error, a timeout (2 s) or a 5xx, 3 tries; up to about 25 s        | `RunFailed` `unavailable`, reason `agent-manager or prompt-studio did not answer, so the orchestrator agent could not start. Try again in a minute.` |
 
-A task before its run has no `runId`. A `RunFailed` before the run has a
-new random `runId` and no `RunStarted`. It ends the task: a `RunBlocked`
-with no run cannot be resumed or cancelled.
+A task before its run has no `runId`. A failure before the run is a
+`RunFailed` with a new random `runId` and no `RunStarted`: the
+orchestrator does not load, the budget refuses the plan call, the plan
+call fails, or the planner gives no valid answer in 2 tries. It ends the
+task: a `RunBlocked` with no run cannot be resumed or cancelled.
 
 The calls of a task (`plan`, `subtask`, `aggregate`, `check`) all have a
 `kind`, so each call gets `CallSettled` and projections counts its cost.
@@ -107,7 +109,9 @@ user:   Make a plan for the owner's request. The request is in the owner_message
         Answer with one JSON object only, with no other text.
         If the request is not clear, ask 1 to 5 short questions: {"questions": ["<question>"]}.
           (or "Do not ask questions." for a task with no conversationId, and after one answer)
-        For a plan: {"subtasks": [{"title", "instructions", "agent", "dependsOn": [<numbers>], "needsApproval"}]} ...
+        For a plan: {"subtasks": [{"title", "instructions", "agent", "dependsOn": [<numbers>], "needsApproval"}]},
+          with 1 to <the most subtasks> subtasks. A title is one line. No line of a title or
+          instructions starts with BEGIN DATA or END DATA.
         "model" is optional: one model of the agent.
         The agents that you can use: <PLAN_AGENTS>.
         BEGIN DATA owner_message <new random id>
@@ -125,17 +129,18 @@ model or the owner.
 
 The answer is read as JSON (a JSON code fence is permitted). Then:
 
-| Answer                                                                  | Result                                                                                                                         |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `{"questions": [...]}`, 1 to 5 `ClarifyingQuestion`s, and permitted     | `ClarificationRequested`. The owner `answer` gives `ClarificationAnswered` and a new plan call                                 |
-| `{"subtasks": [...]}` that passes all checks, mode `approval`           | `PlanProposed` `awaitsApproval` true. The run starts after `ApprovePlan` (M3-04)                                               |
-| the same, mode `auto`                                                   | `PlanProposed` `awaitsApproval` false, `PlanApproved` (actor `system`), and the `StartRun` events (`runId` new), in one append |
-| a refused answer, first try of the round                                | one more plan call with the reason                                                                                             |
-| a refused answer, second try                                            | `RunFailed` `validation_failed`, `The orchestrator gave no valid plan in 2 tries. The last reason: <reason>`                   |
-| last `CallFailed` `budget_refused`                                      | `RunFailed` `budget_refused`, `The budget refused the plan call: <reason>`                                                     |
-| last `CallFailed` `rate_limit`, `timeout`, `provider`                   | one more plan call; on the second try `RunFailed` (`rate_limited`, `unavailable`)                                              |
-| last `CallFailed` `invalid`, `cancelled`                                | `RunFailed` `internal`                                                                                                         |
-| a read of a plan agent or the orchestrator that fails (not `not_found`) | `RunFailed` with the code of the read                                                                                          |
+| Answer                                                                                    | Result                                                                                                                                         |
+| ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{"questions": [...]}`, 1 to 5 `ClarifyingQuestion`s, and permitted                       | `ClarificationRequested`. The owner `answer` gives `ClarificationAnswered` and a new plan call                                                 |
+| `{"subtasks": [...]}` that passes all checks, mode `approval`                             | `PlanProposed` `awaitsApproval` true. The run starts after `ApprovePlan` (M3-04)                                                               |
+| the same, mode `auto`                                                                     | `PlanProposed` `awaitsApproval` false, `PlanApproved` (actor `system`), and the `StartRun` events (`runId` new), in one append                 |
+| a refused answer, first try of the round                                                  | one more plan call with the reason                                                                                                             |
+| a refused answer, second try                                                              | `RunFailed` `validation_failed`, `The orchestrator gave no valid plan in 2 tries. The last reason: <reason>`                                   |
+| last `CallFailed` `budget_refused`                                                        | `RunFailed` `budget_refused`, `The budget refused the plan call: <reason>`                                                                     |
+| last `CallFailed` `rate_limit`, `timeout`, `provider`                                     | one more plan call; on the second try `RunFailed` (`rate_limited`, `unavailable`)                                                              |
+| last `CallFailed` `invalid`, `cancelled`                                                  | `RunFailed` `internal`                                                                                                                         |
+| a read of a plan agent or the orchestrator that fails with `unavailable`                  | the handler throws `AgentUnavailableError`: no event, and NATS sends the `llm.*` event again (kit backoff 1 s, 5 s, 30 s, 120 s, then the DLQ) |
+| a read of a plan agent or the orchestrator that fails with another code (not `not_found`) | `RunFailed` with the code of the read                                                                                                          |
 
 A round is the first plan call, or the plan call after the answer. A
 task has at most one round of questions: questions are permitted only
@@ -149,22 +154,36 @@ The checks of a plan, in code:
 - 1 to 20 subtasks. Orchestration makes each `subtaskId`
   (`crypto.randomUUID()`). `dependsOn` has the numbers of other subtasks
   (1 is the first), and orchestration changes them to the ids.
-- The agent name is in `PLAN_AGENTS` (default `writer`), it has an active
-  version, and it is enabled. A `model` is one of the models of that agent.
-- The result parses with `PlanSubtasks` (unique ids, known dependencies,
-  no cycle, the text limits).
-- The subtasks of one agent are not more than its `limits.maxCalls`. The
-  calls of the task so far, the subtasks and 3 more calls (aggregate,
-  check, one rework) are not more than `MAX_CALLS_PER_TASK`.
-- The estimate fits the task budget (below).
+- The agent name is in `PLAN_AGENTS` (default `writer`).
+- `checkPlan` (exported for `EditPlan` and `ReassignSubtask`) checks a
+  plan of agent ids with the loaded agents:
+  - A title has no line break. No line of a title or instructions starts
+    with `BEGIN DATA ` or `END DATA `.
+  - The agent has an active version, it is enabled, and its prompt has
+    no variables. A `model` is one of the models of that agent.
+  - The subtasks of one agent are not more than its `limits.maxCalls`.
+  - The plan parses with `PlanSubtasks` (unique ids, known
+    dependencies, no cycle, the text limits). A refusal names the
+    subtask by its number (1 is the first).
+  - The calls of the task so far, the subtasks and 4 more calls
+    (aggregate, check, one rework subtask, the second aggregate) are not
+    more than `MAX_CALLS_PER_TASK`.
+  - The estimates fit the task budget (below). `checkPlan` sets the
+    estimates of orchestration and ignores estimates in its input.
 
 Estimates (provisional, ADR 0027: orchestration has no prices). The
 estimate of a subtask is `ceil(limits.maxCostMicroUsd / limits.maxCalls)`
 of its agent (5000 micro-USD with the seed agents), in
 `estimatedCostMicroUsd`. `estimatedDurationMs` is 120000 (one call). The
-sum of the estimates plus 2 estimates of the orchestrator (aggregate and
-check) must not be more than the rest of the orchestrator allowance. With
-the seed agents, a plan has at most 7 subtasks.
+sum of the estimates, plus the largest estimate (one rework subtask), plus
+3 estimates of the orchestrator (aggregate, check, second aggregate) must
+not be more than the rest of the orchestrator allowance.
+
+The plan call tells the planner the most subtasks (`maxSubtasks`): the
+smallest of 20, `MAX_CALLS_PER_TASK` minus the calls so far minus 5 (this
+plan call and the 4 end calls), and the rest of the orchestrator
+allowance over its estimate, minus 5. This uses the estimate of the
+orchestrator for each subtask. With the seed agents, it is 5.
 
 ### `llm.*` of an M2 chat call
 
@@ -187,10 +206,11 @@ the store. New tasks have no such call. The events of a call with a
 There is no retry by orchestration in M2: the last `CallFailed` of a call
 ends the run. ai-proxy has already tried the model chain.
 
-Each chat task ends with `RunCompleted` or `RunFailed`, or waits with
+Each M2 chat task ends with `RunCompleted` or `RunFailed`, or waits with
 `RunBlocked`, when its call ends. A call that does not end keeps the task
-`running` until the stale rule below stops it. A reason is cut to 1000
-characters.
+`running` until the stale rule below stops it. The stale rule uses
+`calledAt`, which only a call with no `kind` sets. So new chat tasks have
+no 15-minute stale rule. A reason is cut to 1000 characters.
 
 A `CallCompleted` or `CallFailed` for a task that is completed, failed or
 blocked gives no event, and a warn log `a late call event for a closed
@@ -429,6 +449,13 @@ the owner blocks, and the answer in a `final_answer` block (block id: the
 | `{"pass": true}`                                                                                              | `RunCompleted`: `summary` = the answer, `costMicroUsd` = the cost of the aggregate call                                                                                           |
 | `{"pass": false, "step": n, "feedback": ...}`, step n is in the plan, no rework yet                           | `SubtaskQueued` for step n. It runs again with its earlier output and the feedback (`quality_check` block). Then one more aggregate call, and `RunCompleted` with no second check |
 | a verdict that is not valid JSON or has no valid step, a failed check call, or a check call that cannot start | `RunCompleted` with the answer                                                                                                                                                    |
+
+A step goes back only when there is room for the rework subtask and the
+second aggregate call: both agents load and have a call left under their
+`limits.maxCalls` and allowance, the task has 2 calls left under
+`MAX_CALLS_PER_TASK`, and the rest of the orchestrator allowance is at
+least the estimate of the agent of the step plus the estimate of the
+orchestrator. Else the run completes with the answer.
 
 So the end of a run has at most 2 aggregate calls, 1 check call and 1
 rework subtask. The summary is cut to 100,000 characters. The task cost

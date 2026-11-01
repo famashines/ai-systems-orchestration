@@ -19,8 +19,11 @@ import {
   prepareCall,
   readJson,
   type RunEnv,
+  type RunSettings,
 } from "./run.ts";
 import {
+  AgentUnavailableError,
+  estimate,
   failedCodes,
   fold,
   reason,
@@ -32,9 +35,6 @@ import {
 
 const maxPlanTries = 2;
 export const orchestratorName = "orchestrator";
-
-export const estimate = (limits: AgentLimits): number =>
-  Math.ceil(limits.maxCostMicroUsd / limits.maxCalls);
 
 const isPlanning = (state: TaskState): boolean =>
   (state.status === "submitted" || state.status === "planning") && state.plan === undefined;
@@ -53,9 +53,23 @@ interface Retry {
   output?: string;
 }
 
+const reworkCalls = 4;
+
+export function maxSubtasks(
+  state: TaskState,
+  limits: AgentLimits,
+  settings: Pick<RunSettings, "maxCallsPerTask">,
+): number {
+  const byCalls = settings.maxCallsPerTask - Object.keys(state.calls).length - 1 - reworkCalls;
+  const byMoney =
+    Math.floor((limits.maxCostMicroUsd - state.costMicroUsd) / estimate(limits)) - 1 - reworkCalls;
+  return Math.max(1, Math.min(20, byCalls, byMoney));
+}
+
 function planMessages(
   state: TaskState,
   prompt: { text: string },
+  most: number,
   agents: readonly string[],
   newId: () => string,
   retry?: Retry,
@@ -68,7 +82,7 @@ function planMessages(
     mayAsk(state)
       ? 'If the request is not clear, ask 1 to 5 short questions: {"questions": ["<question>"]}.'
       : "Do not ask questions.",
-    'For a plan: {"subtasks": [{"title": "<short title>", "instructions": "<what to do>", "agent": "<agent name>", "dependsOn": [<numbers of other subtasks>], "needsApproval": false}]}, with 1 to 20 subtasks. The subtasks have the numbers 1, 2, 3 and so on, in their order.',
+    `For a plan: {"subtasks": [{"title": "<short title>", "instructions": "<what to do>", "agent": "<agent name>", "dependsOn": [<numbers of other subtasks>], "needsApproval": false}]}, with 1 to ${String(most)} subtasks. The subtasks have the numbers 1, 2, 3 and so on, in their order. A title is one line. No line of a title or instructions starts with BEGIN DATA or END DATA.`,
     '"needsApproval": true makes the subtask wait for the owner before it starts. "model" is optional: one model of the agent.',
     `The agents that you can use: ${agents.join(", ") || "none"}.`,
   ];
@@ -124,8 +138,15 @@ export function planCall(
     {
       kind: "plan",
       slots: 1,
-      messages: (prompt) =>
-        planMessages(state, prompt, env.settings.planAgents ?? [], env.newId, retry),
+      messages: (prompt, agent) =>
+        planMessages(
+          state,
+          prompt,
+          maxSubtasks(state, agent.limits, env.settings),
+          env.settings.planAgents ?? [],
+          env.newId,
+          retry,
+        ),
     },
     env,
   );
@@ -152,9 +173,13 @@ type PlanResult =
   | { refused: string }
   | { failed: LoadFailure };
 
-const issueText = (error: z.ZodError, root: string): string => {
+const issueText = (error: z.ZodError, root: "subtask" | "question"): string => {
   const [issue] = error.issues;
-  const where = [root, ...(issue?.path ?? []).map(String)].join(".");
+  const [first, ...rest] = issue?.path ?? [];
+  const where =
+    typeof first === "number"
+      ? [`${root} ${String(first + 1)}`, ...rest.map(String)].join(" ")
+      : `the ${root}s`;
   return `The value at ${where} is not valid: ${issue?.message ?? "not known"}.`;
 };
 
@@ -189,14 +214,13 @@ function readPlan(state: TaskState, text: string, env: RunEnv): PlanResult {
     const questions = Questions.safeParse(output.questions);
     return questions.success
       ? { questions: questions.data }
-      : { refused: issueText(questions.error, "questions") };
+      : { refused: issueText(questions.error, "question") };
   }
   const items = PlannerSubtasks.safeParse((output as { subtasks?: unknown }).subtasks);
-  if (!items.success) return { refused: issueText(items.error, "subtasks") };
+  if (!items.success) return { refused: issueText(items.error, "subtask") };
   const allowed = env.settings.planAgents ?? [];
   const ids = items.data.map(() => env.newId());
   const subtasks: PlanSubtask[] = [];
-  const counts = new Map<string, number>();
   for (const [index, item] of items.data.entries()) {
     const which = `Subtask ${String(index + 1)}`;
     const load = allowed.includes(item.agent) ? env.named?.get(item.agent) : undefined;
@@ -206,11 +230,6 @@ function readPlan(state: TaskState, text: string, env: RunEnv): PlanResult {
         ? { refused: `${which} names an agent that has no active version.` }
         : { failed: load };
     }
-    const { agent } = load;
-    if (!agent.enabled) return { refused: `${which} names an agent that is off.` };
-    if (item.model !== undefined && !agent.models.includes(item.model)) {
-      return { refused: `${which} names a model that its agent does not use.` };
-    }
     const dependsOn: string[] = [];
     for (const number of item.dependsOn) {
       const id = ids[number - 1];
@@ -218,6 +237,54 @@ function readPlan(state: TaskState, text: string, env: RunEnv): PlanResult {
         return { refused: `${which} depends on a number that is not a subtask of the plan.` };
       }
       dependsOn.push(id);
+    }
+    subtasks.push({
+      subtaskId: ids[index] ?? env.newId(),
+      title: item.title,
+      instructions: item.instructions,
+      agentId: load.agent.agentId,
+      ...(item.model === undefined ? {} : { model: item.model }),
+      dependsOn,
+      needsApproval: item.needsApproval,
+    });
+  }
+  return checkPlan(state, subtasks, env.agents, env.settings);
+}
+
+export type PlanCheck = { subtasks: PlanSubtask[] } | { refused: string } | { failed: LoadFailure };
+
+const marker = /^(BEGIN|END) DATA /m;
+const lineBreak = /[\n\r\u2028\u2029]/;
+
+export function checkPlan(
+  state: TaskState,
+  plan: readonly PlanSubtask[],
+  agents: ReadonlyMap<string, AgentLoad>,
+  settings: Pick<RunSettings, "maxCallsPerTask">,
+): PlanCheck {
+  const subtasks: PlanSubtask[] = [];
+  const counts = new Map<string, number>();
+  for (const [index, subtask] of plan.entries()) {
+    const which = `Subtask ${String(index + 1)}`;
+    if (lineBreak.test(subtask.title))
+      return { refused: `${which} has a title with a line break.` };
+    if (marker.test(subtask.title) || marker.test(subtask.instructions)) {
+      return { refused: `${which} has a line that starts with BEGIN DATA or END DATA.` };
+    }
+    const load = agents.get(subtask.agentId);
+    if (load === undefined) return { refused: `${which} names an agent that is not known.` };
+    if (!("agent" in load)) {
+      return load.code === "not_found"
+        ? { refused: `${which} names an agent that has no active version.` }
+        : { failed: load };
+    }
+    const { agent, prompt } = load;
+    if (!agent.enabled) return { refused: `${which} names an agent that is off.` };
+    if (subtask.model !== undefined && !agent.models.includes(subtask.model)) {
+      return { refused: `${which} names a model that its agent does not use.` };
+    }
+    if (prompt.variables.length > 0) {
+      return { refused: `${which} names an agent whose prompt has variables.` };
     }
     const count = (counts.get(agent.agentId) ?? 0) + 1;
     if (count > agent.limits.maxCalls) {
@@ -227,47 +294,51 @@ function readPlan(state: TaskState, text: string, env: RunEnv): PlanResult {
     }
     counts.set(agent.agentId, count);
     subtasks.push({
-      subtaskId: ids[index] ?? env.newId(),
-      title: item.title,
-      instructions: item.instructions,
-      agentId: agent.agentId,
-      ...(item.model === undefined ? {} : { model: item.model }),
-      dependsOn,
-      needsApproval: item.needsApproval,
+      ...subtask,
       estimatedCostMicroUsd: estimate(agent.limits),
       estimatedDurationMs: callDurationMs,
     });
   }
-  const plan = PlanSubtasks.safeParse(subtasks);
-  if (!plan.success) return { refused: issueText(plan.error, "subtasks") };
-  return checkBudget(state, plan.data, env);
+  const parsed = PlanSubtasks.safeParse(subtasks);
+  if (!parsed.success) return { refused: issueText(parsed.error, "subtask") };
+  return checkBudget(state, parsed.data, agents, settings);
 }
 
-function checkBudget(state: TaskState, subtasks: PlanSubtask[], env: RunEnv): PlanResult {
-  const load =
-    state.orchestratorId === undefined ? undefined : env.agents.get(state.orchestratorId);
+function checkBudget(
+  state: TaskState,
+  subtasks: PlanSubtask[],
+  agents: ReadonlyMap<string, AgentLoad>,
+  settings: Pick<RunSettings, "maxCallsPerTask">,
+): PlanCheck {
+  const load = state.orchestratorId === undefined ? undefined : agents.get(state.orchestratorId);
   if (load === undefined || !("agent" in load)) {
     return {
       failed: load ?? { code: "internal", reason: "The orchestrator agent is not known." },
     };
   }
   const { limits } = load.agent;
-  const calls = Object.keys(state.calls).length + subtasks.length + 3;
-  if (calls > env.settings.maxCallsPerTask) {
+  const calls = Object.keys(state.calls).length + subtasks.length + reworkCalls;
+  if (calls > settings.maxCallsPerTask) {
     return {
-      refused: `The plan needs more calls than the limit of a task (${String(env.settings.maxCallsPerTask)}). Use fewer subtasks.`,
+      refused: `The plan needs more calls than the limit of a task (${String(settings.maxCallsPerTask)}). Use fewer subtasks.`,
     };
   }
+  const estimates = subtasks.map((subtask) => subtask.estimatedCostMicroUsd ?? 0);
   const total =
-    subtasks.reduce((sum, subtask) => sum + (subtask.estimatedCostMicroUsd ?? 0), 0) +
-    2 * estimate(limits);
+    estimates.reduce((sum, value) => sum + value, 0) +
+    Math.max(...estimates) +
+    3 * estimate(limits);
   const rest = limits.maxCostMicroUsd - state.costMicroUsd;
   if (total > rest) {
     return {
-      refused: `The plan needs up to ${String(total)} micro-USD with the final answer and its check, but the task has ${String(rest)} micro-USD left. Use fewer subtasks.`,
+      refused: `The plan needs up to ${String(total)} micro-USD with the final answer, its check and one rework, but the task has ${String(rest)} micro-USD left. Use fewer subtasks.`,
     };
   }
   return { subtasks };
+}
+
+function throwIfUnavailable(failure: LoadFailure): void {
+  if (failure.code === "unavailable") throw new AgentUnavailableError(failure.reason);
 }
 
 type FinalCall = { completed: CallCompletedEventPayloadV1 } | { failed: CallFailedEventPayloadV1 };
@@ -275,8 +346,11 @@ type FinalCall = { completed: CallCompletedEventPayloadV1 } | { failed: CallFail
 export function settlePlan(state: TaskState, final: FinalCall, env: RunEnv): TaskEvent[] {
   const load =
     state.orchestratorId === undefined ? undefined : env.agents.get(state.orchestratorId);
-  const again = (retry?: Retry): TaskEvent[] | undefined =>
-    state.planTries < maxPlanTries ? planCall(state, load, env, retry) : undefined;
+  const again = (retry?: Retry): TaskEvent[] | undefined => {
+    if (state.planTries >= maxPlanTries) return undefined;
+    if (load !== undefined && !("agent" in load)) throwIfUnavailable(load);
+    return planCall(state, load, env, retry);
+  };
   if ("failed" in final) {
     const { errorClass, reason: why } = final.failed;
     if (errorClass === "budget_refused") {
@@ -291,7 +365,10 @@ export function settlePlan(state: TaskState, final: FinalCall, env: RunEnv): Tas
   }
   const { text } = final.completed;
   const result = readPlan(state, text, env);
-  if ("failed" in result) return failed(state, result.failed.code, result.failed.reason, env);
+  if ("failed" in result) {
+    throwIfUnavailable(result.failed);
+    return failed(state, result.failed.code, result.failed.reason, env);
+  }
   if ("refused" in result) {
     return (
       again({ reason: result.refused, output: text }) ??

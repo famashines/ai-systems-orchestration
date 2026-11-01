@@ -119,6 +119,13 @@ export class TaskConflictError extends Error {
   }
 }
 
+export class AgentUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AgentUnavailableError";
+  }
+}
+
 export const initialState: TaskState = {
   taskId: "",
   status: "new",
@@ -151,6 +158,9 @@ export function nextCall(
   }
   return { maxCostMicroUsd: rest };
 }
+
+export const estimate = (limits: AgentLimits): number =>
+  Math.ceil(limits.maxCostMicroUsd / limits.maxCalls);
 
 export const failedCodes: Record<Exclude<LlmErrorClass, "budget_refused">, ErrorCode> = {
   rate_limit: "rate_limited",
