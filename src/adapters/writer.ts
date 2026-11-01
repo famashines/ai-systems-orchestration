@@ -112,13 +112,13 @@ function agentLoader({
   };
 }
 
-export function writerLoader(sources: WriterSources): () => Promise<AgentLoad> {
+export function agentByNameLoader(sources: WriterSources): (name: string) => Promise<AgentLoad> {
   const load = agentLoader(sources);
-  return () =>
-    load("/internal/agents/by-name/writer/active-version", {
-      agent: "writer agent",
-      prompt: "writer prompt",
-      log: "writer",
+  return (name) =>
+    load(`/internal/agents/by-name/${encodeURIComponent(name)}/active-version`, {
+      agent: `${name} agent`,
+      prompt: `${name} prompt`,
+      log: name,
     });
 }
 

@@ -19,6 +19,7 @@ const app = createService({
     logger,
     settings: { maxParallel: 1, maxCallsPerTask: 1, retryDelaysMs: [], checkpointTimeoutMs: 0 },
     loadAgent: down,
+    loadAgentByName: down,
     verify: () => Promise.resolve({ sub: "owner-1", roles: ["owner"], exp: 0 }),
   }),
   drainDelayMs: 0,

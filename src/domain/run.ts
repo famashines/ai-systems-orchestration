@@ -1,7 +1,9 @@
 import {
   CallRequestedEventPayloadV1,
+  SubtaskInstructions,
   type CallCompletedEventPayloadV1,
   type CallFailedEventPayloadV1,
+  type CallKind,
   type CallMessage,
   type CheckpointDecision,
   type ErrorCode,
@@ -9,7 +11,9 @@ import {
   type RunBlockedEventPayloadV1,
   type TaskMode,
 } from "@famashines/ai-systems-contracts";
+import { z } from "zod";
 import {
+  estimate,
   failedCodes,
   fold,
   isRunActive,
@@ -33,6 +37,7 @@ export interface RunSettings {
   maxCallsPerTask: number;
   retryDelaysMs: readonly number[];
   checkpointTimeoutMs: number;
+  planAgents?: readonly string[];
 }
 
 export interface RunEnv {
@@ -40,6 +45,7 @@ export interface RunEnv {
   newId: () => string;
   settings: RunSettings;
   agents: ReadonlyMap<string, AgentLoad>;
+  named?: ReadonlyMap<string, AgentLoad>;
 }
 
 export interface StartRun {
@@ -196,6 +202,14 @@ const busyCount = (state: TaskState) =>
 
 export function agentsToLoad(state: TaskState, env: Pick<RunEnv, "now" | "settings">): string[] {
   if (state.status !== "running" || state.runId === undefined) return [];
+  if (allDone(state)) {
+    const next = finalStep(state);
+    const orchestrator = state.orchestratorId === undefined ? [] : [state.orchestratorId];
+    if ("call" in next) return orchestrator;
+    const redo =
+      "rework" in next ? planned(state).find((item) => item.subtaskId === next.rework) : undefined;
+    return redo === undefined ? [] : [...new Set([redo.agentId, ...orchestrator])];
+  }
   const free = env.settings.maxParallel - busyCount(state);
   const ids = planned(state)
     .filter(
@@ -231,58 +245,115 @@ export function subtaskMessages(
 ): CallMessage[] {
   const current = subtaskOf(state, subtask.subtaskId);
   const steers = state.steers.slice(0, current?.steers ?? state.steers.length);
+  const later = [...state.answers, ...steers];
   const outputs = subtask.dependsOn.flatMap((id) => {
     const output = subtaskOf(state, id)?.output;
     return output === undefined ? [] : [output];
   });
+  const rework = state.rework?.subtaskId === subtask.subtaskId ? state.rework : undefined;
   const lines = [
     "Do one step of the owner's request. The request is in the owner_message data block below.",
     authorityLine,
     `The step: ${subtask.title}`,
     `What to do in this step: ${subtask.instructions}`,
   ];
-  if (steers.length > 0) {
-    lines.push("Later messages of the owner about the request are in more owner_message blocks.");
-  }
+  if (later.length > 0) lines.push(laterLine);
   if (outputs.length > 0) {
     lines.push("The outputs of earlier steps are in subtask_output data blocks.");
   }
+  if (rework !== undefined) {
+    lines.push(
+      "This step runs again after a check of the final answer. The earlier output of this step is in the last subtask_output block, and the check is in the quality_check data block.",
+    );
+  }
   lines.push(block("owner_message", newId(), state.text ?? ""));
+  const feedback = rework === undefined ? undefined : verdictOf(rework.verdict.text);
   return [
     { role: "system", content: prompt.text },
     { role: "user", content: lines.join("\n") },
-    ...steers.map(({ text }) => ({
-      role: "user" as const,
-      content: block("owner_message", newId(), text),
-    })),
-    ...outputs.map(({ callId, text }) => {
-      const room = 100_000 - block("subtask_output", callId, "").length;
-      return {
-        role: "user" as const,
-        content: block("subtask_output", callId, text.slice(0, room)),
-      };
-    }),
+    ...ownerBlocks(later, newId),
+    ...outputs.map(outputBlock),
+    ...(rework === undefined ? [] : [outputBlock(rework.output)]),
+    ...(rework === undefined || feedback === undefined || feedback.pass
+      ? []
+      : [cut("quality_check", rework.verdict.callId, feedback.feedback)]),
   ];
 }
 
-function start(state: TaskState, subtask: PlanSubtask, load: AgentLoad, env: RunEnv): TaskEvent[] {
-  const { subtaskId } = subtask;
-  const current = subtaskOf(state, subtaskId);
-  const tries = current?.tries ?? 0;
-  const tryNumber = current?.status === "retrying" ? (current.nextTry ?? tries + 1) : tries + 1;
-  const fail = (code: ErrorCode, why: string, retryable: boolean) =>
-    failTry(state, subtaskId, tryNumber, { code, reason: why, retryable }, noUsage, env);
-  if (!("agent" in load)) return fail(load.code, load.reason, load.code === "unavailable");
-  const { agent, prompt } = load;
-  if (!agent.enabled) return fail("unavailable", `The agent ${agent.name} is off.`, false);
-  if (prompt.variables.length > 0) {
-    return fail(
-      "internal",
-      "The agent prompt has variables. Orchestration cannot fill them.",
-      false,
-    );
+const laterLine = "Later messages of the owner about the request are in more owner_message blocks.";
+
+const cut = (name: string, id: string, text: string): CallMessage => ({
+  role: "user",
+  content: block(name, id, text.slice(0, 100_000 - block(name, id, "").length)),
+});
+
+const outputBlock = ({ callId, text }: { callId: string; text: string }) =>
+  cut("subtask_output", callId, text);
+
+export const ownerBlocks = (
+  messages: readonly { text: string }[],
+  newId: () => string,
+): CallMessage[] =>
+  messages.map(({ text }) => ({ role: "user", content: block("owner_message", newId(), text) }));
+
+export function readJson(text: string): unknown {
+  const fenced = /^```(?:json)?\n([\s\S]*)\n```$/.exec(text.trim());
+  try {
+    return JSON.parse(fenced?.[1] ?? text) as unknown;
+  } catch {
+    return undefined;
   }
-  const ids = { ...runIds(state), subtaskId };
+}
+
+const Verdict = z.union([
+  z.object({ pass: z.literal(true) }),
+  z.object({ pass: z.literal(false), step: z.int().min(1).max(20), feedback: SubtaskInstructions }),
+]);
+
+function verdictOf(text: string): z.infer<typeof Verdict> | undefined {
+  const parsed = Verdict.safeParse(readJson(text));
+  return parsed.success ? parsed.data : undefined;
+}
+
+type Prepared =
+  | { call: CallRequestedEventPayloadV1 }
+  | { fail: { code: ErrorCode; reason: string; retryable: boolean } }
+  | { stop: string }
+  | { wait: true };
+
+interface CallSpec {
+  kind: CallKind;
+  subtaskId?: string;
+  models?: string[] | undefined;
+  slots: number;
+  messages: (prompt: Writer["prompt"], agent: Writer["agent"]) => CallMessage[];
+}
+
+export function prepareCall(
+  state: TaskState,
+  load: AgentLoad | undefined,
+  spec: CallSpec,
+  env: RunEnv,
+): Prepared {
+  if (load === undefined) {
+    return { fail: { code: "internal", reason: "The agent is not known.", retryable: false } };
+  }
+  if (!("agent" in load)) return { fail: { ...load, retryable: load.code === "unavailable" } };
+  const { agent, prompt } = load;
+  if (!agent.enabled) {
+    return {
+      fail: { code: "unavailable", reason: `The agent ${agent.name} is off.`, retryable: false },
+    };
+  }
+  if (prompt.variables.length > 0) {
+    return {
+      fail: {
+        code: "internal",
+        reason: "The agent prompt has variables. Orchestration cannot fill them.",
+        retryable: false,
+      },
+    };
+  }
   const calls = Object.values(state.calls);
   const next =
     calls.length >= env.settings.maxCallsPerTask
@@ -291,69 +362,239 @@ function start(state: TaskState, subtask: PlanSubtask, load: AgentLoad, env: Run
           calls: calls.filter((call) => call.agentId === agent.agentId).length,
           costMicroUsd: state.costMicroUsd,
         });
-  if ("stop" in next) {
-    return [
-      event("orchestration.SubtaskBlocked", {
-        ...ids,
-        code: "runaway_stopped",
-        reason: reason(next.stop),
-      }),
-    ];
-  }
+  if ("stop" in next) return next;
   const inFlight = inFlightCaps(state);
   const rest = next.maxCostMicroUsd - inFlight;
-  const slots =
-    current?.solo === true
-      ? 1
-      : Math.max(1, Math.min(env.settings.maxParallel - busyCount(state), toRun(state)));
-  const share = Math.max(0, Math.floor(rest / slots));
-  if (share === 0 && inFlight > 0) return [];
-  const callId = env.newId();
+  const share = Math.max(0, Math.floor(rest / spec.slots));
+  if (share === 0 && inFlight > 0) return { wait: true };
   const request = {
     taskId: state.taskId,
-    callId,
+    callId: env.newId(),
     agentId: agent.agentId,
     agentVersion: agent.version,
-    messages: subtaskMessages(state, subtask, prompt, env.newId),
-    models: subtask.model === undefined ? agent.models : [subtask.model],
+    messages: spec.messages(prompt, agent),
+    models: spec.models ?? agent.models,
     maxTokens: agent.limits.maxTokens,
     maxDurationMs: callDurationMs,
     maxCostMicroUsd: share === 0 ? rest : share,
-    kind: "subtask" as const,
-    subtaskId,
+    kind: spec.kind,
+    ...optional("subtaskId", spec.subtaskId),
   };
   const parsed = CallRequestedEventPayloadV1.safeParse(request);
   if (!parsed.success) {
     const [issue] = parsed.error.issues;
     const tooLarge = issue?.code === "too_big" || /bytes/.test(issue?.message ?? "");
     const where = issue?.path.join(".") ?? "";
-    return fail(
-      tooLarge ? "payload_too_large" : "internal",
-      `The call of the subtask is not valid (${where}): ${issue?.message ?? "not known"}`,
-      false,
-    );
+    const what = spec.kind === "subtask" ? "the subtask" : `the ${spec.kind} step`;
+    return {
+      fail: {
+        code: tooLarge ? "payload_too_large" : "internal",
+        reason: `The call of ${what} is not valid (${where}): ${issue?.message ?? "not known"}`,
+        retryable: false,
+      },
+    };
   }
+  return { call: request };
+}
+
+function start(state: TaskState, subtask: PlanSubtask, load: AgentLoad, env: RunEnv): TaskEvent[] {
+  const { subtaskId } = subtask;
+  const current = subtaskOf(state, subtaskId);
+  const tries = current?.tries ?? 0;
+  const tryNumber = current?.status === "retrying" ? (current.nextTry ?? tries + 1) : tries + 1;
+  const slots =
+    current?.solo === true
+      ? 1
+      : Math.max(1, Math.min(env.settings.maxParallel - busyCount(state), toRun(state)));
+  const prepared = prepareCall(
+    state,
+    load,
+    {
+      kind: "subtask",
+      subtaskId,
+      slots,
+      models: subtask.model === undefined ? undefined : [subtask.model],
+      messages: (prompt) => subtaskMessages(state, subtask, prompt, env.newId),
+    },
+    env,
+  );
+  if ("wait" in prepared) return [];
+  const ids = { ...runIds(state), subtaskId };
+  if ("stop" in prepared) {
+    return [
+      event("orchestration.SubtaskBlocked", {
+        ...ids,
+        code: "runaway_stopped",
+        reason: reason(prepared.stop),
+      }),
+    ];
+  }
+  if ("fail" in prepared) {
+    return failTry(state, subtaskId, tryNumber, prepared.fail, noUsage, env);
+  }
+  const { call } = prepared;
   return [
     event("orchestration.SubtaskStarted", {
       ...ids,
       tryNumber,
-      callId,
-      agentId: agent.agentId,
-      agentVersion: agent.version,
+      callId: call.callId,
+      agentId: call.agentId,
+      agentVersion: call.agentVersion,
     }),
-    event("orchestration.CallRequested", request),
+    event("orchestration.CallRequested", call),
   ];
 }
 
-export function completeRun(state: TaskState): TaskEvent[] {
-  const summary = planned(state)
+const allDone = (state: TaskState) =>
+  planned(state).length > 0 &&
+  planned(state).every(({ subtaskId }) => hasStatus(state, subtaskId, "done"));
+
+const stepList = (state: TaskState) => [
+  "The steps:",
+  ...planned(state).map(({ title }, index) => `${String(index + 1)}. ${title}`),
+];
+
+function outputsSummary(state: TaskState): string {
+  return planned(state)
     .map(
       (subtask) =>
         `## ${subtask.title}\n\n${subtaskOf(state, subtask.subtaskId)?.output?.text ?? ""}`,
     )
-    .join("\n\n")
-    .slice(0, 100_000);
-  return [event("orchestration.RunCompleted", { ...runIds(state), summary, costMicroUsd: 0 })];
+    .join("\n\n");
+}
+
+type Final =
+  | { wait: true }
+  | { call: "aggregate" | "check" }
+  | { rework: string }
+  | { done: { summary: string; costMicroUsd: number } };
+
+function finalStep(state: TaskState): Final {
+  const last = state.orchestratorCall;
+  if (last !== undefined && state.calls[last.callId]?.settled === false) return { wait: true };
+  const { answer, verdict } = state;
+  if (answer === undefined) {
+    return last?.kind === "aggregate"
+      ? { done: { summary: outputsSummary(state), costMicroUsd: 0 } }
+      : { call: "aggregate" };
+  }
+  const done = { done: { summary: answer.text, costMicroUsd: answer.costMicroUsd } };
+  if (state.rework !== undefined) return done;
+  if (verdict === undefined) return { call: "check" };
+  const result = verdictOf(verdict.text);
+  const redo = result?.pass === false ? planned(state)[result.step - 1] : undefined;
+  return redo === undefined ? done : { rework: redo.subtaskId };
+}
+
+function aggregateMessages(state: TaskState, prompt: Writer["prompt"], newId: () => string) {
+  const later = [...state.answers, ...state.steers];
+  const lines = [
+    "Write the final answer to the owner's request. The request is in the owner_message data block below.",
+    authorityLine,
+    "The outputs of the steps are in subtask_output data blocks, in the order of the steps. Use them, and name the steps that you use, for example (step 2).",
+    ...stepList(state),
+    ...(later.length > 0 ? [laterLine] : []),
+    block("owner_message", newId(), state.text ?? ""),
+  ];
+  const outputs = planned(state).flatMap(({ subtaskId }) => {
+    const output = subtaskOf(state, subtaskId)?.output;
+    return output === undefined ? [] : [outputBlock(output)];
+  });
+  return [
+    { role: "system" as const, content: prompt.text },
+    { role: "user" as const, content: lines.join("\n") },
+    ...ownerBlocks(later, newId),
+    ...outputs,
+  ];
+}
+
+function checkMessages(
+  state: TaskState,
+  answer: { callId: string; text: string },
+  prompt: Writer["prompt"],
+  newId: () => string,
+) {
+  const later = [...state.answers, ...state.steers];
+  const lines = [
+    "Check the final answer against the owner's request. The request is in the owner_message data block below, and the final answer is in the final_answer data block.",
+    authorityLine,
+    'Answer with one JSON object only, with no other text: {"pass": true} when the final answer does the request, or {"pass": false, "step": <number of the one step to do again>, "feedback": "<what that step must change>"}.',
+    ...stepList(state),
+    ...(later.length > 0 ? [laterLine] : []),
+    block("owner_message", newId(), state.text ?? ""),
+  ];
+  return [
+    { role: "system" as const, content: prompt.text },
+    { role: "user" as const, content: lines.join("\n") },
+    ...ownerBlocks(later, newId),
+    cut("final_answer", answer.callId, answer.text),
+  ];
+}
+
+function roomForRework(state: TaskState, subtaskId: string, env: RunEnv): boolean {
+  const redo = planned(state).find((item) => item.subtaskId === subtaskId);
+  const redoLoad = redo === undefined ? undefined : env.agents.get(redo.agentId);
+  const orchestrator =
+    state.orchestratorId === undefined ? undefined : env.agents.get(state.orchestratorId);
+  if (redoLoad === undefined || !("agent" in redoLoad)) return false;
+  if (orchestrator === undefined || !("agent" in orchestrator)) return false;
+  const calls = Object.values(state.calls);
+  if (calls.length + 2 > env.settings.maxCallsPerTask) return false;
+  const same = redoLoad.agent.agentId === orchestrator.agent.agentId ? 1 : 0;
+  const stopped = ({ agent }: Writer) =>
+    "stop" in
+    nextCall(agent.limits, {
+      calls: calls.filter((call) => call.agentId === agent.agentId).length + same,
+      costMicroUsd: state.costMicroUsd,
+    });
+  if (stopped(redoLoad) || stopped(orchestrator)) return false;
+  const rest = orchestrator.agent.limits.maxCostMicroUsd - state.costMicroUsd;
+  return rest >= estimate(redoLoad.agent.limits) + estimate(orchestrator.agent.limits);
+}
+
+export function completeRun(state: TaskState, env: RunEnv): TaskEvent[] {
+  const ids = runIds(state);
+  const completed = (done: { summary: string; costMicroUsd: number }) => [
+    event("orchestration.RunCompleted", {
+      ...ids,
+      summary: done.summary.slice(0, 100_000),
+      costMicroUsd: done.costMicroUsd,
+    }),
+  ];
+  const next = finalStep(state);
+  if ("wait" in next) return [];
+  if ("rework" in next) {
+    return roomForRework(state, next.rework, env)
+      ? [event("orchestration.SubtaskQueued", { ...ids, subtaskId: next.rework })]
+      : completed({
+          summary: state.answer?.text ?? "",
+          costMicroUsd: state.answer?.costMicroUsd ?? 0,
+        });
+  }
+  if ("done" in next) return completed(next.done);
+  if (state.status !== "running") return [];
+  const { answer } = state;
+  const load =
+    state.orchestratorId === undefined ? undefined : env.agents.get(state.orchestratorId);
+  const prepared = prepareCall(
+    state,
+    load,
+    {
+      kind: next.call,
+      slots: 1,
+      messages: (prompt) =>
+        answer === undefined
+          ? aggregateMessages(state, prompt, env.newId)
+          : checkMessages(state, answer, prompt, env.newId),
+    },
+    env,
+  );
+  if ("call" in prepared) return [event("orchestration.CallRequested", prepared.call)];
+  return completed(
+    answer === undefined
+      ? { summary: outputsSummary(state), costMicroUsd: 0 }
+      : { summary: answer.text, costMicroUsd: answer.costMicroUsd },
+  );
 }
 
 function step(state: TaskState, env: RunEnv): TaskEvent[] {
@@ -409,9 +650,7 @@ function step(state: TaskState, env: RunEnv): TaskEvent[] {
         }),
       ];
     }
-    if (plan.every(({ subtaskId }) => hasStatus(state, subtaskId, "done"))) {
-      return completeRun(state);
-    }
+    if (allDone(state)) return completeRun(state, env);
   }
   if (state.status !== "running") return [];
   if (busyCount(state) >= env.settings.maxParallel) return [];

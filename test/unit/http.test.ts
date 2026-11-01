@@ -43,6 +43,7 @@ const app = createService({
       retryDelaysMs: [5000],
       checkpointTimeoutMs: 1,
     },
+    loadAgentByName: () => Promise.resolve({ code: "not_found", reason: "No agent." }),
     loadAgent: () =>
       Promise.resolve({
         agent: {

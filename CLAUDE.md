@@ -21,9 +21,10 @@ Rules for all ai-systems repos: `ai-systems-docs/CLAUDE.md`
 ```
 src
 ├── domain/state.ts            task state, evolve (the status table), runaway rules, no I/O
-├── domain/run.ts              run process manager: decideRun, schedule, subtask calls, no I/O
-├── domain/task.ts             decide (M2 chat path and dispatch), steer and refusals, no I/O
-├── application/run.ts         act (read, decide, load agents, schedule, append), onTimer
+├── domain/run.ts              run process manager: decideRun, schedule, prepareCall, subtask calls, aggregate and check, no I/O
+├── domain/task.ts             decide (chat start and dispatch), answers, steer and refusals, toLoadBefore, no I/O
+├── domain/plan.ts             plan call, planner answer checks and estimates, clarify, auto approval, no I/O
+├── application/run.ts         act (read, load for decide, decide, load agents, schedule, append), onTimer
 ├── application/submit-task.ts the command handler
 ├── application/chat.ts        the handlers of OwnerMessagePosted and llm.*
 ├── adapters/http.ts           routes, zod schemas of the bodies and queries

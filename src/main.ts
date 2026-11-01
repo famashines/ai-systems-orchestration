@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AgentName } from "@famashines/ai-systems-contracts";
 import { createJwtVerifier } from "@famashines/ai-systems-kit/auth";
 import { commonEnv, loadConfig } from "@famashines/ai-systems-kit/config";
 import { createEventStore, eventStoreMigration } from "@famashines/ai-systems-kit/event-store";
@@ -14,9 +15,9 @@ import { createLogger, startTelemetry } from "@famashines/ai-systems-kit/observa
 import { z } from "zod";
 import { routes } from "./adapters/http.ts";
 import { startTimers, timersMigration } from "./adapters/timers.ts";
-import { agentByIdLoader, writerLoader } from "./adapters/writer.ts";
-import { onLlmEvent, onOwnerMessage, type ChatDeps } from "./application/chat.ts";
-import { onTimer } from "./application/run.ts";
+import { agentByIdLoader, agentByNameLoader } from "./adapters/writer.ts";
+import { onLlmEvent, onOwnerMessage } from "./application/chat.ts";
+import { onTimer, type TaskDeps } from "./application/run.ts";
 
 export const service = "orchestration";
 
@@ -60,6 +61,11 @@ export const envSchema = commonEnv.omit({ SERVICE_NAME: true }).extend({
       .max(30 * 86_400_000),
   ),
   TIMER_INTERVAL_MS: int("1000", z.int().min(100).max(60_000)),
+  PLAN_AGENTS: z
+    .string()
+    .default("writer")
+    .transform((value) => value.split(",").map((name) => name.trim()))
+    .pipe(z.array(AgentName).min(1).max(50)),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.url().optional(),
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: z.url().optional(),
 });
@@ -93,7 +99,7 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
     agentManagerUrl: config.AGENT_MANAGER_URL,
     promptStudioUrl: config.PROMPT_STUDIO_URL,
   };
-  const chat: ChatDeps = {
+  const chat: TaskDeps = {
     store,
     newId: randomUUID,
     now: () => new Date(),
@@ -103,9 +109,10 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
       maxCallsPerTask: config.MAX_CALLS_PER_TASK,
       retryDelaysMs: config.SUBTASK_RETRY_DELAYS_MS,
       checkpointTimeoutMs: config.CHECKPOINT_TIMEOUT_MS,
+      planAgents: config.PLAN_AGENTS,
     },
-    loadWriter: writerLoader(sources),
     loadAgent: agentByIdLoader(sources),
+    loadAgentByName: agentByNameLoader(sources),
   };
   const timers = startTimers({
     db: mongo.db,

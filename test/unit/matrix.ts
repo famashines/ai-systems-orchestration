@@ -61,7 +61,7 @@ const proposed = (awaitsApproval: boolean) =>
     subtasks: [step(A, []), step(B, [A])],
     awaitsApproval,
   });
-const call = (kind?: "subtask") =>
+const call = (kind?: "subtask" | "plan") =>
   event("orchestration.CallRequested", {
     taskId,
     callId,
@@ -72,7 +72,7 @@ const call = (kind?: "subtask") =>
     maxTokens: 1000,
     maxDurationMs: 120_000,
     maxCostMicroUsd: 25_000,
-    ...(kind === undefined ? {} : { kind, subtaskId: A }),
+    ...(kind === undefined ? {} : kind === "plan" ? { kind } : { kind, subtaskId: A }),
   });
 const usage = { inputTokens: 1, outputTokens: 1, costMicroUsd: 10 };
 
@@ -117,18 +117,22 @@ export const states: TaskStatus[] = [
   "rejected",
 ];
 
+const planSettled = event("orchestration.CallSettled", { taskId, callId, kind: "plan", ...usage });
+const asked = [
+  submitted,
+  call("plan"),
+  planSettled,
+  event("orchestration.ClarificationRequested", { taskId, questions: ["Which?"] }),
+];
+
 const before = (plan: boolean): Record<string, HistoryEvent[]> => ({
   new: [],
-  submitted: [submitted],
-  clarifying: [
-    submitted,
-    event("orchestration.ClarificationRequested", { taskId, questions: ["Which?"] }),
-  ],
+  submitted: [submitted, call("plan")],
+  clarifying: asked,
   planning: plan
     ? [submitted, proposed(false), event("orchestration.PlanApproved", { taskId, planVersion: 1 })]
     : [
-        submitted,
-        event("orchestration.ClarificationRequested", { taskId, questions: ["Which?"] }),
+        ...asked,
         event("orchestration.ClarificationAnswered", {
           taskId,
           conversationId,
@@ -244,8 +248,10 @@ export function cell(events: HistoryEvent[], command: TaskCommand): string {
       maxCallsPerTask: 50,
       retryDelaysMs: [5000],
       checkpointTimeoutMs: 60_000,
+      planAgents: ["writer"],
     },
     agents: new Map([[agentId, agent]]),
+    named: new Map([["writer", agent]]),
   };
   const state = fold(initialState, events);
   try {
