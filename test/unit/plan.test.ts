@@ -971,6 +971,14 @@ test("a task with no model uses the agent limits: a cost above its allowance sto
   assert.deepEqual(types(end.events), ["CallSettled", "SubtaskCompleted", "RunCompleted"]);
 });
 
+test("a task with an effort and no model sends no effort", () => {
+  const { events } = planned({ effort: "high" });
+  assert.equal(find(events, "orchestration.TaskSubmitted").effort, "high");
+  const call = lastCall(events);
+  assert.equal(call.effort, undefined);
+  assert.deepEqual(call.models, orchestrator.agent.models);
+});
+
 test("a task with a model: a subtask model of the owner runs with no effort and the task limits", () => {
   const first = planned(withModel);
   const proposed = handle(
