@@ -198,8 +198,28 @@ async function seed(history: [string, object][]): Promise<void> {
 
 const awaiting = async (subtasks: PlanSubtask[], mode = "approval"): Promise<string> => {
   const taskId = randomUUID();
+  const callId = randomUUID();
   await seed([
     ["TaskSubmitted", { taskId, text: "Write a report", mode }],
+    [
+      "CallRequested",
+      {
+        taskId,
+        callId,
+        agentId: agent.agentId,
+        agentVersion: 1,
+        messages: [{ role: "user", content: "Plan." }],
+        models: agent.models,
+        maxTokens: 4096,
+        maxDurationMs: 120_000,
+        maxCostMicroUsd: 50_000,
+        kind: "plan",
+      },
+    ],
+    [
+      "CallSettled",
+      { taskId, callId, kind: "plan", inputTokens: 1, outputTokens: 1, costMicroUsd: 100 },
+    ],
     ["PlanProposed", { taskId, planVersion: 1, subtasks, awaitsApproval: true }],
   ]);
   return taskId;
@@ -236,7 +256,14 @@ test("EditPlan, ApprovePlan, PauseRun, ResumeRun, ReassignSubtask and CancelRun 
   assert.equal(edited.status, 201);
   assert.deepEqual(await byCommand(taskId, edited.commandId), ["PlanEdited:owner"]);
   const plan = (await streamOf(taskId)).at(-1)?.payload as { subtasks: PlanSubtask[] };
-  assert.equal(plan.subtasks[0]?.estimatedCostMicroUsd, undefined);
+  assert.equal(plan.subtasks[0]?.estimatedCostMicroUsd, 5_000);
+  const refused = await send("EditPlan", {
+    taskId,
+    planVersion: 2,
+    subtasks: [step(first, { agentId: otherAgent })],
+  });
+  assert.equal(refused.status, 400);
+  assert.equal(refused.body.detail, "Subtask 1 names an agent that has no active version.");
 
   const stale = await send("ApprovePlan", { taskId, planVersion: 1 });
   assert.equal(stale.status, 409);
@@ -274,11 +301,19 @@ test("EditPlan, ApprovePlan, PauseRun, ResumeRun, ReassignSubtask and CancelRun 
     (await send("ReassignSubtask", { taskId, subtaskId: first, agentId: otherAgent })).status,
     409,
   );
+  const wrongModel = await send("ReassignSubtask", {
+    taskId,
+    subtaskId: second,
+    agentId: agent.agentId,
+    model: "openai/gpt-4.1-nano",
+  });
+  assert.equal(wrongModel.status, 400);
+  assert.equal(wrongModel.body.detail, "Subtask 1 names a model that its agent does not use.");
   const reassigned = await send("ReassignSubtask", {
     taskId,
     subtaskId: second,
-    agentId: otherAgent,
-    model: "openai/gpt-4.1-nano",
+    agentId: agent.agentId,
+    model: "google/gemini-2.5-flash-lite",
   });
   assert.equal(reassigned.status, 201);
   assert.deepEqual(await byCommand(taskId, reassigned.commandId), ["SubtaskReassigned:owner"]);
@@ -369,5 +404,5 @@ test("the owner token is checked before the body; the actor must be the subject;
   assert.equal(other.status, 403);
   assert.equal((await send("ApprovePlan", { taskId })).status, 400);
   assert.equal((await send("PauseRun", { taskId: randomUUID() })).status, 404);
-  assert.equal((await streamOf(taskId)).length, 2);
+  assert.equal((await streamOf(taskId)).length, 4);
 });

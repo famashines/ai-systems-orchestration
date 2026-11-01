@@ -21,6 +21,7 @@ import {
   ForbiddenError,
   UnavailableError,
   validate,
+  ValidationError,
   type Handler,
   type Request,
   type Route,
@@ -29,7 +30,13 @@ import { isInfrastructure } from "@famashines/ai-systems-kit/messaging";
 import { z } from "zod";
 import { act, system, type Act, type TaskDeps } from "../application/run.ts";
 import { submitTask } from "../application/submit-task.ts";
-import { TaskConflictError, TaskExistsError, type TaskCommand } from "../domain/task.ts";
+import {
+  AgentUnavailableError,
+  PlanRefusedError,
+  TaskConflictError,
+  TaskExistsError,
+  type TaskCommand,
+} from "../domain/task.ts";
 
 const owner = Actor.extend({ kind: z.literal("owner") });
 
@@ -67,6 +74,14 @@ const EventsQuery = z.object({
 export function toHttpError(error: unknown): unknown {
   if (error instanceof TaskExistsError || error instanceof TaskConflictError) {
     return new ConflictError(error.message);
+  }
+  if (error instanceof PlanRefusedError) {
+    return new ValidationError(error.message, [
+      { path: "body.payload", code: "custom", message: error.message },
+    ]);
+  }
+  if (error instanceof AgentUnavailableError) {
+    return new UnavailableError("agent-manager or prompt-studio did not answer");
   }
   if (isInfrastructure(error)) return new UnavailableError("The database is not available");
   return error;

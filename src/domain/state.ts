@@ -119,6 +119,13 @@ export class TaskConflictError extends Error {
   }
 }
 
+export class PlanRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PlanRefusedError";
+  }
+}
+
 export class AgentUnavailableError extends Error {
   constructor(message: string) {
     super(message);

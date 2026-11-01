@@ -12,12 +12,15 @@ import {
   type TaskMode,
 } from "@famashines/ai-systems-contracts";
 import { z } from "zod";
+import { checkPlan as checkSubtasks } from "./plan.ts";
 import {
+  AgentUnavailableError,
   estimate,
   failedCodes,
   fold,
   isRunActive,
   nextCall,
+  PlanRefusedError,
   reason,
   runningCalls,
   TaskConflictError,
@@ -536,8 +539,12 @@ function roomForRework(state: TaskState, subtaskId: string, env: RunEnv): boolea
   const redoLoad = redo === undefined ? undefined : env.agents.get(redo.agentId);
   const orchestrator =
     state.orchestratorId === undefined ? undefined : env.agents.get(state.orchestratorId);
-  if (redoLoad === undefined || !("agent" in redoLoad)) return false;
-  if (orchestrator === undefined || !("agent" in orchestrator)) return false;
+  const usable = (load: AgentLoad | undefined): load is Writer =>
+    load !== undefined &&
+    "agent" in load &&
+    load.agent.enabled &&
+    load.prompt.variables.length === 0;
+  if (!usable(redoLoad) || !usable(orchestrator)) return false;
   const calls = Object.values(state.calls);
   if (calls.length + 2 > env.settings.maxCallsPerTask) return false;
   const same = redoLoad.agent.agentId === orchestrator.agent.agentId ? 1 : 0;
@@ -791,7 +798,7 @@ const orchestratorCalls = (state: TaskState) =>
 
 const planOnly = new Set(["PauseRun", "ResumeRun", "RetrySubtask", "ReassignSubtask"]);
 
-function checkPlan(state: TaskState, planVersion: number): void {
+function checkPlanVersion(state: TaskState, planVersion: number): void {
   if (state.status !== "awaiting_approval" || state.plan === undefined) {
     throw new TaskConflictError("The task has no plan that waits for approval.");
   }
@@ -802,11 +809,12 @@ function checkPlan(state: TaskState, planVersion: number): void {
   }
 }
 
-function withoutEstimates(subtask: PlanSubtask): PlanSubtask {
-  const next = { ...subtask };
-  delete next.estimatedCostMicroUsd;
-  delete next.estimatedDurationMs;
-  return next;
+function checked(state: TaskState, plan: PlanSubtask[], env: RunEnv): PlanSubtask[] {
+  const result = checkSubtasks(state, plan, env.agents, env.settings);
+  if ("subtasks" in result) return result.subtasks;
+  if ("refused" in result) throw new PlanRefusedError(result.refused);
+  if (result.failed.code === "unavailable") throw new AgentUnavailableError(result.failed.reason);
+  throw new Error(result.failed.reason);
 }
 
 const endedTask = ["new", "completed", "failed", "cancelled", "rejected"];
@@ -931,7 +939,7 @@ export function decideRun(state: TaskState, command: RunCommand, env: RunEnv): T
     case "RetryDue":
       return [];
     case "ApprovePlan": {
-      checkPlan(state, command.planVersion);
+      checkPlanVersion(state, command.planVersion);
       const approved = event("orchestration.PlanApproved", {
         taskId,
         planVersion: command.planVersion,
@@ -942,16 +950,16 @@ export function decideRun(state: TaskState, command: RunCommand, env: RunEnv): T
       ];
     }
     case "EditPlan":
-      checkPlan(state, command.planVersion);
+      checkPlanVersion(state, command.planVersion);
       return [
         event("orchestration.PlanEdited", {
           taskId,
           planVersion: command.planVersion + 1,
-          subtasks: command.subtasks.map(withoutEstimates),
+          subtasks: checked(state, command.subtasks, env),
         }),
       ];
     case "RejectPlan":
-      checkPlan(state, command.planVersion);
+      checkPlanVersion(state, command.planVersion);
       return [
         event("orchestration.PlanRejected", {
           taskId,
@@ -976,6 +984,11 @@ export function decideRun(state: TaskState, command: RunCommand, env: RunEnv): T
       ) {
         throw new TaskConflictError("The subtask is not in the run, or it runs or has ended.");
       }
+      const current = planned(state).find((item) => item.subtaskId === subtaskId);
+      const next: PlanSubtask = { ...(current as PlanSubtask), agentId };
+      if (model === undefined) delete next.model;
+      else next.model = model;
+      checked(state, [{ ...next, dependsOn: [] }], env);
       return [
         event("orchestration.SubtaskReassigned", {
           ...runIds(state),

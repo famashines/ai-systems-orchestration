@@ -21,6 +21,8 @@ const verify: JwtVerifier = (token) =>
   (tokens[token] ?? (() => Promise.reject(new UnauthorizedError())))(token);
 const agentId = "00000000-0000-4000-8000-00000000a005";
 let failingAppends = 0;
+const downAgent = "00000000-0000-4000-8000-00000000a0dd";
+const unknownAgent = "00000000-0000-4000-8000-00000000a0ee";
 const app = createService({
   logger,
   routes: routes({
@@ -44,25 +46,31 @@ const app = createService({
       checkpointTimeoutMs: 1,
     },
     loadAgentByName: () => Promise.resolve({ code: "not_found", reason: "No agent." }),
-    loadAgent: () =>
-      Promise.resolve({
-        agent: {
-          agentId,
-          name: "writer",
-          enabled: true,
-          version: 1,
-          prompt: { promptId: agentId, version: 1 },
-          models: ["openai/gpt-4.1-nano"],
-          limits: { maxCalls: 10, maxTokens: 1000, maxCostMicroUsd: 50_000 },
-        },
-        prompt: {
-          promptId: agentId,
-          name: "writer",
-          version: 1,
-          text: "You write.",
-          variables: [],
-        },
-      }),
+    loadAgent: (id) =>
+      Promise.resolve(
+        id === downAgent
+          ? { code: "unavailable" as const, reason: "No answer." }
+          : id === unknownAgent
+            ? { code: "not_found" as const, reason: "No agent." }
+            : {
+                agent: {
+                  agentId,
+                  name: "writer",
+                  enabled: true,
+                  version: 1,
+                  prompt: { promptId: agentId, version: 1 },
+                  models: ["openai/gpt-4.1-nano"],
+                  limits: { maxCalls: 10, maxTokens: 1000, maxCostMicroUsd: 50_000 },
+                },
+                prompt: {
+                  promptId: agentId,
+                  name: "writer",
+                  version: 1,
+                  text: "You write.",
+                  variables: [],
+                },
+              },
+      ),
     verify,
   }),
   drainDelayMs: 0,
@@ -416,4 +424,43 @@ test("an owner command reads and decides again after a concurrent append, at mos
   });
   assert.equal(failingAppends, 0);
   assert.equal((await command("pause-run", pause)).status, 201);
+});
+
+test("EditPlan: a plan that the plan rules refuse gives 400 with the reason; agent-manager down gives 503", async () => {
+  const taskId = await seed();
+  const edit = (agent: string) => ({
+    ...approve(taskId),
+    type: "orchestration.EditPlan",
+    payload: {
+      taskId,
+      planVersion: 1,
+      subtasks: [
+        {
+          subtaskId: taskIds(),
+          title: "A",
+          instructions: "Do it.",
+          agentId: agent,
+          dependsOn: [],
+          needsApproval: false,
+        },
+      ],
+    },
+  });
+  const refused = await command("edit-plan", edit(unknownAgent));
+  assert.equal(refused.status, 400);
+  const problem = (await refused.json()) as { code: string; detail: string; errors: unknown[] };
+  assert.equal(problem.code, "validation_failed");
+  assert.equal(problem.detail, "Subtask 1 names an agent that has no active version.");
+  assert.deepEqual(problem.errors, [
+    {
+      path: "body.payload",
+      code: "custom",
+      message: "Subtask 1 names an agent that has no active version.",
+    },
+  ]);
+  assert.deepEqual(await problemOf(await command("edit-plan", edit(downAgent))), {
+    status: 503,
+    code: "unavailable",
+  });
+  assert.equal((await store.readStream(`task-${taskId}`)).length, 2);
 });
