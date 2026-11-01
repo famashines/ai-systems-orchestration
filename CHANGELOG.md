@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- Owner controls (task M3-04): `POST /internal/commands/<command>` for
+  `approve-plan`, `edit-plan`, `reject-plan`, `pause-run`, `resume-run`,
+  `cancel-run`, `cancel-task`, `retry-subtask`, `reassign-subtask`,
+  `set-task-mode` and `resolve-checkpoint`. Each route checks the owner
+  token before the body (ADR 0028), and `actor.id` must be the `sub`.
+  The owner is the `actor` of the events that the command decides. The
+  same `commandId` gives the first answer (200). 404 for an unknown task,
+  409 for a state that cannot take the command or an old `planVersion`.
+- New domain inputs `ApprovePlan` (then `StartRun`), `EditPlan`,
+  `RejectPlan`, `ReassignSubtask` and `SetTaskMode`. `EditPlan` and
+  `ReassignSubtask` check the plan with `checkPlan` of M3-03 (agents,
+  models, call limits, budget): a refusal gives 400, an agent read that is
+  `unavailable` gives 503. `PlanEdited` has the estimates of
+  orchestration.
+- A step goes back after a failed check only when its agent and the
+  orchestrator are enabled and have prompts with no variables. A line
+  with spaces before `BEGIN DATA ` or `END DATA ` is refused in a plan.
+- `POST /internal/commands/submit-task` checks the owner token too
+  (ADR 0028), and `actor.id` must be the `sub`. Deploy the api-gateway
+  version that forwards `Authorization` on `POST /api/tasks` first.
+- An owner command reads and decides again after a `ConcurrencyError`,
+  at most 3 times, before it gives 409.
+- New env `OIDC_ISSUER`, `OIDC_JWKS_URL`, `OIDC_AUDIENCE`. Deploy: set
+  `OIDC_JWKS_URL` to the Keycloak service, and add the egress to
+  Keycloak.
 - Orchestrator agent (task M3-03): a chat `new_task` is a planned task.
   `TaskSubmitted` has the `mode` of the message (absent: `approval`), and
   the active `orchestrator` agent gets a plan call (`kind` `plan`). Its

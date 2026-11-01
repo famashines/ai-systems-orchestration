@@ -9,14 +9,18 @@ import {
   type ErrorCode,
   type PlanSubtask,
   type RunBlockedEventPayloadV1,
+  type TaskMode,
 } from "@famashines/ai-systems-contracts";
 import { z } from "zod";
+import { checkPlan as checkSubtasks } from "./plan.ts";
 import {
+  AgentUnavailableError,
   estimate,
   failedCodes,
   fold,
   isRunActive,
   nextCall,
+  PlanRefusedError,
   reason,
   runningCalls,
   TaskConflictError,
@@ -83,6 +87,30 @@ export interface RetryDue {
   type: "RetryDue";
   subtaskId: string;
 }
+export interface ApprovePlan {
+  type: "ApprovePlan";
+  planVersion: number;
+}
+export interface EditPlan {
+  type: "EditPlan";
+  planVersion: number;
+  subtasks: PlanSubtask[];
+}
+export interface RejectPlan {
+  type: "RejectPlan";
+  planVersion: number;
+  reason: string;
+}
+export interface ReassignSubtask {
+  type: "ReassignSubtask";
+  subtaskId: string;
+  agentId: string;
+  model?: string;
+}
+export interface SetTaskMode {
+  type: "SetTaskMode";
+  mode: TaskMode;
+}
 
 export type RunCommand =
   | StartRun
@@ -93,7 +121,12 @@ export type RunCommand =
   | RetrySubtask
   | ResolveCheckpoint
   | CheckpointDue
-  | RetryDue;
+  | RetryDue
+  | ApprovePlan
+  | EditPlan
+  | RejectPlan
+  | ReassignSubtask
+  | SetTaskMode;
 
 type Of<T extends TaskEvent["type"]> = Extract<TaskEvent, { type: T }>;
 
@@ -506,8 +539,12 @@ function roomForRework(state: TaskState, subtaskId: string, env: RunEnv): boolea
   const redoLoad = redo === undefined ? undefined : env.agents.get(redo.agentId);
   const orchestrator =
     state.orchestratorId === undefined ? undefined : env.agents.get(state.orchestratorId);
-  if (redoLoad === undefined || !("agent" in redoLoad)) return false;
-  if (orchestrator === undefined || !("agent" in orchestrator)) return false;
+  const usable = (load: AgentLoad | undefined): load is Writer =>
+    load !== undefined &&
+    "agent" in load &&
+    load.agent.enabled &&
+    load.prompt.variables.length === 0;
+  if (!usable(redoLoad) || !usable(orchestrator)) return false;
   const calls = Object.values(state.calls);
   if (calls.length + 2 > env.settings.maxCallsPerTask) return false;
   const same = redoLoad.agent.agentId === orchestrator.agent.agentId ? 1 : 0;
@@ -759,7 +796,28 @@ function closeCheckpoint(
 const orchestratorCalls = (state: TaskState) =>
   runningCalls(state).filter((callId) => state.calls[callId]?.kind !== "subtask");
 
-const planOnly = new Set(["PauseRun", "ResumeRun", "RetrySubtask"]);
+const planOnly = new Set(["PauseRun", "ResumeRun", "RetrySubtask", "ReassignSubtask"]);
+
+function checkPlanVersion(state: TaskState, planVersion: number): void {
+  if (state.status !== "awaiting_approval" || state.plan === undefined) {
+    throw new TaskConflictError("The task has no plan that waits for approval.");
+  }
+  if (state.plan.planVersion !== planVersion) {
+    throw new TaskConflictError(
+      `The plan version is ${String(state.plan.planVersion)}, not ${String(planVersion)}. Read the plan again.`,
+    );
+  }
+}
+
+function checked(state: TaskState, plan: PlanSubtask[], env: RunEnv): PlanSubtask[] {
+  const result = checkSubtasks(state, plan, env.agents, env.settings);
+  if ("subtasks" in result) return result.subtasks;
+  if ("refused" in result) throw new PlanRefusedError(result.refused);
+  if (result.failed.code === "unavailable") throw new AgentUnavailableError(result.failed.reason);
+  throw new Error(result.failed.reason);
+}
+
+const endedTask = ["new", "completed", "failed", "cancelled", "rejected"];
 
 export function decideRun(state: TaskState, command: RunCommand, env: RunEnv): TaskEvent[] {
   const { taskId } = state;
@@ -880,5 +938,68 @@ export function decideRun(state: TaskState, command: RunCommand, env: RunEnv): T
     }
     case "RetryDue":
       return [];
+    case "ApprovePlan": {
+      checkPlanVersion(state, command.planVersion);
+      const approved = event("orchestration.PlanApproved", {
+        taskId,
+        planVersion: command.planVersion,
+      });
+      return [
+        approved,
+        ...decideRun(fold(state, [approved]), { type: "StartRun", runId: env.newId() }, env),
+      ];
+    }
+    case "EditPlan":
+      checkPlanVersion(state, command.planVersion);
+      return [
+        event("orchestration.PlanEdited", {
+          taskId,
+          planVersion: command.planVersion + 1,
+          subtasks: checked(state, command.subtasks, env),
+        }),
+      ];
+    case "RejectPlan":
+      checkPlanVersion(state, command.planVersion);
+      return [
+        event("orchestration.PlanRejected", {
+          taskId,
+          planVersion: command.planVersion,
+          reason: reason(command.reason),
+        }),
+      ];
+    case "ReassignSubtask": {
+      const { subtaskId, agentId, model } = command;
+      if (
+        !isRunActive(state) ||
+        !hasStatus(
+          state,
+          subtaskId,
+          "waiting",
+          "queued",
+          "awaiting_approval",
+          "retrying",
+          "failed",
+          "blocked",
+        )
+      ) {
+        throw new TaskConflictError("The subtask is not in the run, or it runs or has ended.");
+      }
+      const current = planned(state).find((item) => item.subtaskId === subtaskId);
+      const next: PlanSubtask = { ...(current as PlanSubtask), agentId };
+      if (model === undefined) delete next.model;
+      else next.model = model;
+      checked(state, [{ ...next, dependsOn: [] }], env);
+      return [
+        event("orchestration.SubtaskReassigned", {
+          ...runIds(state),
+          subtaskId,
+          agentId,
+          ...optional("model", model),
+        }),
+      ];
+    }
+    case "SetTaskMode":
+      if (endedTask.includes(state.status)) throw new TaskConflictError("The task has ended.");
+      return [event("orchestration.TaskModeChanged", { taskId, mode: command.mode })];
   }
 }

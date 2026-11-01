@@ -253,7 +253,7 @@ function readPlan(state: TaskState, text: string, env: RunEnv): PlanResult {
 
 export type PlanCheck = { subtasks: PlanSubtask[] } | { refused: string } | { failed: LoadFailure };
 
-const marker = /^(BEGIN|END) DATA /m;
+const marker = /^\s*(BEGIN|END) DATA /m;
 const lineBreak = /[\n\r\u2028\u2029]/;
 
 export function checkPlan(

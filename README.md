@@ -15,10 +15,12 @@ dependencies are done, starts at most `MAX_PARALLEL_SUBTASKS` of them,
 retries a failed try with backoff and opens checkpoints. After the last
 subtask, the orchestrator writes the final answer from the outputs and
 checks it (see [End of the run](#end-of-the-run)). The owner controls
-(M3-04) use the ports of [Planned runs](#planned-runs).
+(task M3-04) are the routes `POST /internal/commands/<command>` (see
+[Owner commands](#owner-commands)).
 
 ```
-api-gateway --POST /internal/commands/submit-task--> orchestration
+api-gateway --POST /internal/commands/submit-task (Authorization)--> orchestration
+api-gateway --POST /internal/commands/<owner command> (Authorization)--> orchestration --JWKS--> Keycloak
 conversation-hub --conversation.OwnerMessagePosted (CONVERSATION)--> orchestration
 orchestration --GET /internal/agents/by-name/:name/active-version--> agent-manager (orchestrator, plan agents)
 orchestration --GET /internal/agents/:agentId/active-version--> agent-manager (planned runs)
@@ -158,7 +160,7 @@ The checks of a plan, in code:
 - `checkPlan` (exported for `EditPlan` and `ReassignSubtask`) checks a
   plan of agent ids with the loaded agents:
   - A title has no line break. No line of a title or instructions starts
-    with `BEGIN DATA ` or `END DATA `.
+    with `BEGIN DATA ` or `END DATA `, also after spaces or tabs.
   - The agent has an active version, it is enabled, and its prompt has
     no variables. A `model` is one of the models of that agent.
   - The subtasks of one agent are not more than its `limits.maxCalls`.
@@ -288,6 +290,11 @@ input --> decide(state, input) --> events1
 | Input                                          | Port for                 | Result                                                                                                                                                        |
 | ---------------------------------------------- | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `StartRun {runId}` (plan approved)             | M3-03 (auto mode), M3-04 | `RunStarted`, `SubtaskQueued` (no dependencies) or `SubtaskWaiting` for each subtask, then the first starts                                                   |
+| `ApprovePlan` (awaiting_approval)              | M3-04                    | `PlanApproved` for the last `planVersion`, then the events of `StartRun` with a new `runId`                                                                   |
+| `EditPlan` (awaiting_approval)                 | M3-04                    | `checkPlan`, then `PlanEdited` with the next `planVersion` and the estimates of orchestration; it waits for approval again                                    |
+| `RejectPlan` (awaiting_approval)               | M3-04                    | `PlanRejected` for the last `planVersion`, with the reason; the task is `rejected`                                                                            |
+| `ReassignSubtask` (active run)                 | M3-04                    | `checkPlan` of the subtask, then `SubtaskReassigned` for a subtask that is not running and has not ended; the next try uses the new agent or model            |
+| `SetTaskMode` (not ended)                      | M3-04                    | `TaskModeChanged`, nothing else: a plan that waits for approval still waits                                                                                   |
 | `PauseRun` (running)                           | M3-04                    | `RunPaused`. No new call starts. Running calls finish, and their dependents are queued                                                                        |
 | `ResumeRun` (paused)                           | M3-04                    | `RunResumed`, then the queued and due subtasks start                                                                                                          |
 | `ResumeRun` (blocked, not subtask_failed)      | M3-04                    | `RunResumed`, `SubtaskQueued` for each blocked subtask                                                                                                        |
@@ -302,9 +309,8 @@ input --> decide(state, input) --> events1
 | `llm.CallCompleted`, final `llm.CallFailed`    | consumer `LLM`           | below                                                                                                                                                         |
 
 Another owner command in a state that cannot take it gives
-`TaskConflictError`. M3-04 maps it to `409 conflict`. M3-04 also adds
-the command idempotency (`command` of `store.append`) and the owner as the
-`actor` of the command events (`actorOf` of `act`).
+`TaskConflictError`, and the route gives `409 conflict`. A `planVersion`
+that is not the last version of the plan is a conflict too.
 
 ### Calls of a subtask
 
@@ -506,7 +512,8 @@ replay the DLQ after the rollout.
 
 | Method | Path                                           | Does                                                                                                                                   |
 | ------ | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/internal/commands/submit-task`               | Submit a new task                                                                                                                      |
+| POST   | `/internal/commands/submit-task`               | Submit a new task. Needs an owner bearer token                                                                                         |
+| POST   | `/internal/commands/<command>`                 | An owner command (below). Needs an owner bearer token                                                                                  |
 | GET    | `/internal/events?afterPosition=<n>&limit=<m>` | Replay API: all events in position order                                                                                               |
 | GET    | `/health`                                      | Liveness: 200 while the process runs                                                                                                   |
 | GET    | `/ready`                                       | Readiness: 200 when MongoDB answers and the migrations are done, else 503 with the names of the failing checks (`mongo`, `migrations`) |
@@ -523,7 +530,7 @@ The body is a `CommandEnvelopeV1` with a `SubmitTaskCommandPayloadV1`
 {
   "commandId": "6f1c2b9e-1d1a-4c55-9b0e-3a7f0d5e8c21",
   "type": "orchestration.SubmitTask",
-  "actor": { "kind": "owner", "id": "<owner id>" },
+  "actor": { "kind": "owner", "id": "<sub of the token>" },
   "payload": { "text": "Write a poem", "mode": "auto" }
 }
 ```
@@ -532,7 +539,11 @@ The body is a `CommandEnvelopeV1` with a `SubmitTaskCommandPayloadV1`
   takes it from the `Idempotency-Key` header.
 - `type` must be `orchestration.SubmitTask`.
 - `expectedVersion` is optional. If it is there, it must be `0`.
-- `actor.kind` must be `owner` in M1. api-gateway sends the owner.
+- The request needs `Authorization: Bearer <access token>`, checked
+  before the body, the same as the [owner commands](#owner-commands). A
+  task can start a paid plan call (ADR 0028).
+- `actor.kind` must be `owner`, and `actor.id` must be the `sub` of the
+  token.
 - `mode` is `auto` or `approval` (the default).
 
 | Status   | When                                | Body                                             |
@@ -540,6 +551,8 @@ The body is a `CommandEnvelopeV1` with a `SubmitTaskCommandPayloadV1`
 | 201      | A new task                          | `{ "taskId": "<uuid>", "version": 1 }`           |
 | 200      | The same `commandId` came before    | The first answer again. No new event.            |
 | 400      | The body is not valid               | Problem JSON with `errors` (paths, never values) |
+| 401      | No token, or a token not valid      | Problem JSON                                     |
+| 403      | No `owner` role, or another `sub`   | Problem JSON                                     |
 | 409      | The stream exists (a task id clash) | Problem JSON, `code` `conflict`                  |
 | 413, 415 | The body is too large, or not JSON  | Problem JSON                                     |
 | 503      | MongoDB does not answer in 5 s      | Problem JSON, `code` `unavailable`, no detail    |
@@ -549,6 +562,85 @@ The service makes the task id (UUID v4). It appends with
 `correlationId` = the task id, `causationId` = the `commandId`, and the
 `actor` of the command. The event and the stored answer are in one
 MongoDB transaction.
+
+### Owner commands
+
+`POST /internal/commands/<command>`, where `<command>` is the command name
+in kebab case:
+
+| Path                 | `type`                            | Payload (contracts v0.4.1)          |
+| -------------------- | --------------------------------- | ----------------------------------- |
+| `approve-plan`       | `orchestration.ApprovePlan`       | `ApprovePlanCommandPayloadV1`       |
+| `edit-plan`          | `orchestration.EditPlan`          | `EditPlanCommandPayloadV1`          |
+| `reject-plan`        | `orchestration.RejectPlan`        | `RejectPlanCommandPayloadV1`        |
+| `pause-run`          | `orchestration.PauseRun`          | `PauseRunCommandPayloadV1`          |
+| `resume-run`         | `orchestration.ResumeRun`         | `ResumeRunCommandPayloadV1`         |
+| `cancel-run`         | `orchestration.CancelRun`         | `CancelRunCommandPayloadV1`         |
+| `cancel-task`        | `orchestration.CancelTask`        | `CancelTaskCommandPayloadV1`        |
+| `retry-subtask`      | `orchestration.RetrySubtask`      | `RetrySubtaskCommandPayloadV1`      |
+| `reassign-subtask`   | `orchestration.ReassignSubtask`   | `ReassignSubtaskCommandPayloadV1`   |
+| `set-task-mode`      | `orchestration.SetTaskMode`       | `SetTaskModeCommandPayloadV1`       |
+| `resolve-checkpoint` | `orchestration.ResolveCheckpoint` | `ResolveCheckpointCommandPayloadV1` |
+
+```json
+{
+  "commandId": "6f1c2b9e-1d1a-4c55-9b0e-3a7f0d5e8c21",
+  "type": "orchestration.ApprovePlan",
+  "actor": { "kind": "owner", "id": "<sub of the token>" },
+  "payload": { "taskId": "<task id>", "planVersion": 2 }
+}
+```
+
+- The request needs `Authorization: Bearer <access token>`. The route
+  checks it with `kit/auth` before it reads the body (role `owner`, issuer
+  `OIDC_ISSUER`, audience `OIDC_AUDIENCE`), the same as budget (ADR 0028).
+  All owner commands check it, also the commands with no money effect.
+- `actor.kind` must be `owner`, and `actor.id` must be the `sub` of the
+  token.
+- `expectedVersion` is not permitted. The version check of a plan command
+  is `planVersion`.
+- `commandId` is the idempotency key (api-gateway takes it from
+  `Idempotency-Key`). The route first looks for an event of the task with
+  `causationId` = `commandId`. When there is one, it gives 200 with the
+  first answer and appends nothing, also when the state of the task
+  changed after the first command. The append also stores the `commandId`
+  in `commands` (kit), so two requests with the same `commandId` at the
+  same time give one append.
+- A 409 is not stored. So it is safe to send the same `commandId` again
+  after a 409: the route decides again with the state of that time.
+- A concurrent append to the task (for example an `llm.*` event of the
+  run) gives a `ConcurrencyError`. The route then reads the task and
+  decides again, at most 3 times in total, before it gives 409.
+- The events that the command decides (for example `PlanApproved`,
+  `RunStarted` and `SubtaskQueued` of `ApprovePlan`) have the owner as
+  `actor`. The events that follow from the run (`SubtaskStarted`,
+  `CallRequested`, `CheckpointOpened`, `RunBlocked`, `RunCompleted`) have
+  the actor `system`. All have `causationId` = `commandId`. audit-trace
+  reads the owner from the event (ARCHITECTURE 11.1).
+- `EditPlan` and `ReassignSubtask` check the plan with `checkPlan` (see
+  [Planning](#planning)), the same rules as a plan of the orchestrator.
+  `act` loads the agents of the plan and the orchestrator by id before it
+  decides. `EditPlan` ignores the estimates of the payload: `PlanEdited`
+  has the estimates of orchestration. `ReassignSubtask` checks the
+  subtask with its new agent and model as a plan of one subtask (its
+  dependencies are not in that check). A plan that the rules refuse
+  gives 400 with the reason in `detail`. A read of an agent that fails
+  with `unavailable` gives 503 and no event, so the owner sends the
+  command again.
+
+| Status | When                                                                             | Body                                          |
+| ------ | -------------------------------------------------------------------------------- | --------------------------------------------- |
+| 201    | The command is done                                                              | `{ "taskId": "<uuid>", "version": <n> }`      |
+| 200    | The same `commandId` came before                                                 | The first answer again. No new event.         |
+| 400    | The body is not valid, or the plan rules refuse the plan                         | Problem JSON with `errors` (paths, no values) |
+| 401    | No token, or a token that is not valid                                           | Problem JSON                                  |
+| 403    | No `owner` role, or `actor.id` is not the `sub` of the token                     | Problem JSON                                  |
+| 404    | The task is not known                                                            | Problem JSON, `code` `not_found`              |
+| 409    | The state cannot take the command, an old `planVersion`, or 3 concurrent appends | Problem JSON, `code` `conflict`, the reason   |
+| 413    | The body is too large                                                            | Problem JSON                                  |
+| 503    | MongoDB, Keycloak, agent-manager or prompt-studio does not answer                | Problem JSON, `code` `unavailable`            |
+
+`version` is the version of the task stream after the append.
 
 ### `GET /internal/events`
 
@@ -580,6 +672,9 @@ Environment variables (`.env.example` has all of them):
 | `RELEASE`                                                           | `local`                                | Release id in logs and metrics                                            |
 | `AGENT_MANAGER_URL`                                                 | `http://ai-systems-agent-manager:8080` | agent-manager, for the agent versions                                     |
 | `PROMPT_STUDIO_URL`                                                 | `http://ai-systems-prompt-studio:8080` | prompt-studio, for the prompt version                                     |
+| `OIDC_ISSUER`                                                       | the realm                              | Keycloak realm `https://auth.famashines.com/realms/ai-systems`            |
+| `OIDC_JWKS_URL`                                                     | from the issuer                        | JWKS inside the cluster; else `<issuer>/protocol/openid-connect/certs`    |
+| `OIDC_AUDIENCE`                                                     | `ai-systems-app`                       | Audience and `azp` of the owner token                                     |
 | `MAX_CALLS_PER_TASK`                                                | `50`                                   | Calls of one task, all agents together, 1 to 1000 (ADR 0015)              |
 | `MAX_PARALLEL_SUBTASKS`                                             | `3`                                    | Subtasks of one run that run at the same time, 1 to 20 (ARCHITECTURE 8.2) |
 | `SUBTASK_RETRY_DELAYS_MS`                                           | `5000,30000`                           | Backoff before try 2 and try 3 of a subtask, two values, 1 ms to 1 h      |
@@ -671,6 +766,10 @@ and an admin user that makes the streams.
   planned run test appends a task stream with a due
   `SubtaskRetrying`: the timer loop starts the try, and the test ends the
   subtask calls with `llm.CallCompleted` until `RunCompleted`.
+- `test/integration/controls.test.ts` signs owner tokens with a local key
+  and a JWKS fake, appends a task stream, and sends each owner command. It
+  checks the events, the owner `actor` (also on the NATS message), the
+  replay of a `commandId`, and 401, 403, 404 and 409.
 - `test:e2e`: nothing of orchestration is faked. It clones budget,
   agent-manager, prompt-studio and ai-proxy at fixed `main` commits into
   `E2E_DIR` (it reuses a clone that is there and fetches the commit), runs `npm ci`, and starts
@@ -689,7 +788,10 @@ and an admin user that makes the streams.
   fails), then 1 USD. The test gives the mock 4 answers for the first seed
   model, in call order: the plan JSON (one `writer` subtask), the subtask
   output, the final answer and `{"pass": true}`. The task completes with
-  the final answer. With no `E2E_DIR`, the tests are
+  the final answer. A third test sends a task in mode `approval`: the
+  plan waits, the test signs an owner token with a local key (a JWKS
+  server in the test process) and sends `approve-plan`, and the run
+  completes with the mock answers. With no `E2E_DIR`, the tests are
   skipped. The CI job `e2e` sets it.
 
 Commands for agents: `CLAUDE.md`.
@@ -704,6 +806,19 @@ Commands for agents: `CLAUDE.md`.
   task in its state: there is no stale rule for these calls. The owner
   can cancel the task (M3-04). Deploy ai-proxy #3 first (it skips a
   `CallRequested` older than 15 minutes).
+- The replay of an owner command looks only in the stream of its task.
+  A `commandId` that was used for another task gives 409, or the first
+  answer with the other `taskId` (api-gateway then gives 502). Use a new
+  key for each command.
+- The same `commandId` with another body gives the first answer and
+  appends nothing (the kit pattern). The route does not compare the
+  bodies.
+- The `LLM` consumer is ordered. While an `AgentUnavailableError` waits
+  for its next delivery (kit backoff up to 120 s), the `llm.*` events of
+  all other tasks wait too.
+- On the cluster the owner routes need `OIDC_JWKS_URL` (the Keycloak
+  service) and a NetworkPolicy egress from orchestration to Keycloak on
+  port 8080, the same as budget.
 - A subtask call with no end keeps its subtask `running`: there is no
   stale rule for subtask calls. A `SubtaskStarted` timer is an M4 item.
   The owner can cancel the run (M3-04).

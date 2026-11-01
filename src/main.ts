@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { AgentName } from "@famashines/ai-systems-contracts";
+import { createJwtVerifier } from "@famashines/ai-systems-kit/auth";
 import { commonEnv, loadConfig } from "@famashines/ai-systems-kit/config";
 import { createEventStore, eventStoreMigration } from "@famashines/ai-systems-kit/event-store";
 import { createService } from "@famashines/ai-systems-kit/http";
@@ -41,6 +42,9 @@ export const envSchema = commonEnv.omit({ SERVICE_NAME: true }).extend({
   NATS_PASSWORD: z.string().min(1),
   AGENT_MANAGER_URL: httpUrl.default("http://ai-systems-agent-manager:8080"),
   PROMPT_STUDIO_URL: httpUrl.default("http://ai-systems-prompt-studio:8080"),
+  OIDC_ISSUER: httpUrl.default("https://auth.famashines.com/realms/ai-systems"),
+  OIDC_JWKS_URL: httpUrl.optional(),
+  OIDC_AUDIENCE: z.string().min(1).default("ai-systems-app"),
   MAX_PARALLEL_SUBTASKS: int("3", z.int().min(1).max(20)),
   MAX_CALLS_PER_TASK: int("50", z.int().min(1).max(1000)),
   SUBTASK_RETRY_DELAYS_MS: z
@@ -134,9 +138,16 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
       ordered: true,
     }),
   ];
+  const verify = createJwtVerifier({
+    issuer: config.OIDC_ISSUER,
+    audience: config.OIDC_AUDIENCE,
+    requiredRole: "owner",
+    ...(config.OIDC_JWKS_URL === undefined ? {} : { jwksUrl: config.OIDC_JWKS_URL }),
+    logger,
+  });
   const app = createService({
     logger,
-    routes: routes({ store, newId: randomUUID }),
+    routes: routes({ ...chat, verify }),
     readiness: {
       mongo: mongo.ready,
       migrations: async () =>

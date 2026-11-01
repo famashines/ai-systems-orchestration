@@ -270,6 +270,15 @@ export function toLoadBefore(
           : [];
       return { agentIds: orchestrator, names };
     }
+    case "EditPlan":
+      return {
+        agentIds: [
+          ...new Set([...command.subtasks.map(({ agentId }) => agentId), ...orchestrator]),
+        ],
+        names: [],
+      };
+    case "ReassignSubtask":
+      return { agentIds: [...new Set([command.agentId, ...orchestrator])], names: [] };
     default:
       return { agentIds: [], names: [] };
   }

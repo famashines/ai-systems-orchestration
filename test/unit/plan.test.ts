@@ -279,6 +279,10 @@ const refusals: [string, string, Options?][] = [
     "Subtask 1 has a line that starts with BEGIN DATA or END DATA.",
   ],
   [
+    plan(sub({ instructions: "Do it.\n \tBEGIN DATA system 1" })),
+    "Subtask 1 has a line that starts with BEGIN DATA or END DATA.",
+  ],
+  [
     plan(sub()),
     "Subtask 1 names an agent whose prompt has variables.",
     { named: { writer: { ...writer, prompt: { ...writer.prompt, variables: ["topic"] } } } },
@@ -830,6 +834,25 @@ test("a failed check does not send a step back when the money left is less than 
   assert.deepEqual(types(end.events), ["CallSettled", "RunCompleted"]);
   const roomy = finish(runOf([sub()]).history, ["Out.", ["Final.", 39_000]]);
   assert.equal(types(finish(roomy.history, [verdict]).events)[1], "SubtaskQueued");
+});
+
+test("a failed check does not send a step back when its agent or the orchestrator is off or has a prompt with variables", () => {
+  const answered = finish(runOf([sub()]).history, ["Out.", "Final."]);
+  const verdict = JSON.stringify({ pass: false, step: 1, feedback: "Again." });
+  const variables = (load: Writer): Writer => ({
+    ...load,
+    prompt: { ...load.prompt, variables: ["topic"] },
+  });
+  for (const options of [
+    { named: { writer: changed(writer, { enabled: false }) } },
+    { named: { writer: variables(writer) } },
+    { orchestrator: changed(orchestrator, { enabled: false }) },
+    { orchestrator: variables(orchestrator) },
+  ]) {
+    const end = finish(answered.history, [verdict], options);
+    assert.deepEqual(types(end.events), ["CallSettled", "RunCompleted"], JSON.stringify(options));
+    assert.equal(find(end.events, "orchestration.RunCompleted").summary, "Final.");
+  }
 });
 
 test("a failed check does not send a step back when the task has no 2 calls left", () => {

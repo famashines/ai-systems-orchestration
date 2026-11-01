@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync } from "node:fs";
+import { createServer as createHttpServer, type Server } from "node:http";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -18,6 +19,7 @@ import {
   waitFor,
   type Started,
 } from "@famashines/ai-systems-kit/testing";
+import { exportJWK, generateKeyPair, SignJWT, type CryptoKey } from "jose";
 import { envSchema, start } from "../../src/main.ts";
 import { natsConfig, password, streams } from "../nats.ts";
 
@@ -79,6 +81,9 @@ let mongo: Mongo;
 let admin: Nats;
 let mock: MockOpenRouter;
 let orchestration: Awaited<ReturnType<typeof start>> | undefined;
+const issuer = "https://auth.example.test/realms/ai-systems";
+let jwks: Server | undefined;
+let privateKey: CryptoKey;
 
 async function startSibling(name: string, env: Record<string, string>): Promise<void> {
   const port = await freePort();
@@ -143,7 +148,19 @@ before(
       OPENROUTER_API_KEY: "mock-key",
       OPENROUTER_BASE_URL: mock.url,
     });
+    const pair = await generateKeyPair("RS256", { extractable: true });
+    privateKey = pair.privateKey;
+    const jwk = { ...(await exportJWK(pair.publicKey)), kid: "k1", alg: "RS256", use: "sig" };
+    jwks = createHttpServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ keys: [jwk] }));
+    });
+    await new Promise<void>((resolve) => jwks?.listen(0, "127.0.0.1", resolve));
+    const jwksAddress = jwks.address();
+    const jwksPort = typeof jwksAddress === "object" && jwksAddress ? jwksAddress.port : 0;
     const config = loadConfig(envSchema, {
+      OIDC_ISSUER: issuer,
+      OIDC_JWKS_URL: `http://127.0.0.1:${String(jwksPort)}/certs`,
       MONGODB_URI: mongoContainer.url,
       NATS_SERVERS: natsContainer.url,
       NATS_USER: "ai-systems-orchestration",
@@ -160,6 +177,7 @@ before(
 after(async () => {
   if (root === undefined) return;
   await orchestration?.app.close();
+  await new Promise((resolve) => jwks?.close(resolve));
   for (const child of children) child.kill("SIGTERM");
   await Promise.all(
     children
@@ -310,5 +328,83 @@ test(
     const subtaskMessages = subtaskRequest?.body.messages as { content: string }[];
     assert.match(subtaskMessages[0]?.content ?? "", /^You are the writer agent\./);
     assert.match(subtaskMessages[1]?.content ?? "", /\nThe step: Haiku\n/);
+  },
+);
+
+const ownerToken = () =>
+  new SignJWT({ typ: "Bearer", azp: "ai-systems-app", realm_access: { roles: ["owner"] } })
+    .setProtectedHeader({ alg: "RS256", kid: "k1" })
+    .setIssuer(issuer)
+    .setAudience("ai-systems-app")
+    .setSubject("owner-1")
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .sign(privateKey);
+
+test(
+  "approval mode: the plan waits, the owner approves it with ApprovePlan, and the run completes",
+  { skip: root === undefined },
+  async () => {
+    const [first] = seedModels;
+    const plan = JSON.stringify({
+      subtasks: [{ title: "Poem", instructions: "Write a short poem.", agent: "writer" }],
+    });
+    mock.reply(
+      first ?? "",
+      streamOf(first ?? "", [plan]),
+      streamOf(first ?? "", ["Light on the water."]),
+      streamOf(first ?? "", ["The poem (step 1): Light on the water."]),
+      streamOf(first ?? "", ['{"pass": true}']),
+    );
+    const before = mock.received.length;
+    const { taskId } = await chat("Write a short poem about light.", "approval");
+    await waitFor(
+      async () =>
+        (await events().countDocuments({
+          streamId: `task-${taskId}`,
+          type: "orchestration.PlanProposed",
+        })) > 0,
+      60_000,
+    );
+    const proposed = await events().findOne({
+      streamId: `task-${taskId}`,
+      type: "orchestration.PlanProposed",
+    });
+    assert.equal(proposed?.payload.awaitsApproval, true);
+    assert.equal(mock.received.length, before + 1);
+    const commandId = randomUUID();
+    const response = await fetch(
+      `http://127.0.0.1:${String(orchestration?.address.port)}/internal/commands/approve-plan`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${await ownerToken()}`,
+        },
+        body: JSON.stringify({
+          commandId,
+          type: "orchestration.ApprovePlan",
+          actor: { kind: "owner", id: "owner-1" },
+          payload: { taskId, planVersion: proposed.payload.planVersion },
+        }),
+      },
+    );
+    assert.equal(response.status, 201);
+    const stream = (await ended(taskId)) as (Stored & {
+      actor: { kind: string; id: string };
+      causationId: string;
+    })[];
+    assert.equal(stream.at(-1)?.type, "orchestration.RunCompleted");
+    assert.equal(stream.at(-1)?.payload.summary, "The poem (step 1): Light on the water.");
+    const approved = stream.find((event) => event.type === "orchestration.PlanApproved");
+    assert.deepEqual(approved?.actor, { kind: "owner", id: "owner-1" });
+    assert.equal(approved.causationId, commandId);
+    assert.deepEqual(
+      stream
+        .filter((event) => event.type === "orchestration.CallRequested")
+        .map((event) => event.payload.kind),
+      ["plan", "subtask", "aggregate", "check"],
+    );
+    assert.equal(mock.received.length, before + 4);
   },
 );
