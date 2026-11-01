@@ -12,8 +12,11 @@
 - `steer` and `answer` messages give `MessageRefused`. A steer or an
   answer for a call older than 15 minutes ends that run with `RunFailed`
   first. A late call event for a closed task gives a warn log.
-- agent-manager and prompt-studio reads: 3 tries in about 10 s for a 5xx
-  or a network error, then `RunFailed` `unavailable`.
+- agent-manager and prompt-studio reads: 3 tries for a 5xx, a network
+  error or a timeout, then `RunFailed` `unavailable`. One read takes up to
+  about 12 s, the two reads up to about 25 s.
+- Another 4xx (not 404) from agent-manager or prompt-studio gives
+  `RunFailed` `internal` with no retry (task M2-19).
 - Exactly-once handling: the kit `processed` marker is in the transaction
   of the append. New migration `000-processed`.
 - New env `AGENT_MANAGER_URL` and `PROMPT_STUDIO_URL`.

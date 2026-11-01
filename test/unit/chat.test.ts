@@ -285,3 +285,44 @@ test("writerLoader tries a 5xx or a network error 3 times, then gives unavailabl
   assert.ok(err instanceof ReadFailedError);
   assert.ok(err.cause instanceof Error);
 });
+
+test("writerLoader gives internal with no retry for a 4xx that is not 404", async (t) => {
+  const cases: [Record<string, [number, unknown]>, number, unknown][] = [
+    [
+      { [agentPath]: [403, {}] },
+      1,
+      { code: "internal", reason: "agent-manager refused the read of the writer agent." },
+    ],
+    [
+      { [agentPath]: [401, {}] },
+      1,
+      { code: "internal", reason: "agent-manager refused the read of the writer agent." },
+    ],
+    [
+      { [agentPath]: [200, writer.agent], [promptPath]: [400, {}] },
+      2,
+      { code: "internal", reason: "prompt-studio refused the read of the writer prompt." },
+    ],
+    [
+      { [agentPath]: [200, writer.agent], [promptPath]: [429, {}] },
+      2,
+      { code: "internal", reason: "prompt-studio refused the read of the writer prompt." },
+    ],
+  ];
+  for (const [routes, requests, expected] of cases) {
+    const server = await serve(routes);
+    t.after(server.close);
+    warnings.length = 0;
+    const load = writerLoader({
+      agentManagerUrl: server.url,
+      promptStudioUrl: server.url,
+      logger,
+      retryDelaysMs: [1, 1],
+    });
+    assert.deepEqual(await load(), expected);
+    assert.equal(server.requests(), requests);
+    const { err, attempts } = warnings[0]?.details as { err: ReadFailedError; attempts: number };
+    assert.equal(attempts, 1);
+    assert.equal(err.status, Object.values(routes).at(-1)?.[0]);
+  }
+});

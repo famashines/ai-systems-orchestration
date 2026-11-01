@@ -19,9 +19,11 @@ export interface WriterSources {
 }
 
 export class ReadFailedError extends Error {
-  constructor(url: string, what: string, options?: { cause: unknown }) {
+  readonly status: number | undefined;
+  constructor(url: string, what: string, options?: { cause?: unknown; status?: number }) {
     super(`The read of ${url} failed: ${what}`, options);
     this.name = "ReadFailedError";
+    this.status = options?.status;
   }
 }
 
@@ -37,7 +39,9 @@ async function readOnce<S extends z.ZodType>(
     throw new ReadFailedError(url, (error as Error).name, { cause: error });
   }
   if (response.status === 404) return "not_found";
-  if (!response.ok) throw new ReadFailedError(url, `HTTP ${String(response.status)}`);
+  if (!response.ok) {
+    throw new ReadFailedError(url, `HTTP ${String(response.status)}`, { status: response.status });
+  }
   const parsed = schema.safeParse(await response.json().catch(() => undefined));
   return parsed.success ? parsed.data : "invalid";
 }
@@ -60,10 +64,12 @@ export function writerLoader({
       try {
         return await readOnce(url, schema, timeoutMs);
       } catch (error) {
-        const delayMs = retryDelaysMs[attempt];
+        const refused =
+          error instanceof ReadFailedError && error.status !== undefined && error.status < 500;
+        const delayMs = refused ? undefined : retryDelaysMs[attempt];
         if (delayMs === undefined) {
           logger.warn({ err: error, attempts: attempt + 1 }, "the writer read failed");
-          return "unavailable" as const;
+          return refused ? ("refused" as const) : ("unavailable" as const);
         }
         await sleep(delayMs);
       }
@@ -76,6 +82,9 @@ export function writerLoader({
       ActiveAgentVersionResultV1,
     );
     if (agent === "unavailable") return unavailable;
+    if (agent === "refused") {
+      return { code: "internal", reason: "agent-manager refused the read of the writer agent." };
+    }
     if (agent === "not_found") {
       return { code: "not_found", reason: "The writer agent has no active version." };
     }
@@ -88,6 +97,9 @@ export function writerLoader({
       PromptVersionResultV1,
     );
     if (prompt === "unavailable") return unavailable;
+    if (prompt === "refused") {
+      return { code: "internal", reason: "prompt-studio refused the read of the writer prompt." };
+    }
     if (prompt === "not_found") {
       return { code: "not_found", reason: "The prompt version of the writer agent is not there." };
     }

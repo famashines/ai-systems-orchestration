@@ -68,7 +68,8 @@ OwnerMessagePosted{intent: new_task}
 | The agent has `enabled: false`                                              | `RunFailed` `unavailable`                                                                                                                      |
 | The prompt version has variables                                            | `RunFailed` `internal` (M2 has no values to fill them)                                                                                         |
 | A runaway rule (below) stops the call                                       | `RunBlocked` `runaway_stopped`                                                                                                                 |
-| A network error, a timeout (2 s) or a 5xx, 3 times in about 10 s            | `RunFailed` `unavailable`, reason `agent-manager or prompt-studio did not answer, so the writer agent could not start. Try again in a minute.` |
+| Another 4xx (400, 401, 403, 429 ...), with no retry                         | `RunFailed` `internal`                                                                                                                         |
+| A network error, a timeout (2 s) or a 5xx, 3 tries; up to about 25 s        | `RunFailed` `unavailable`, reason `agent-manager or prompt-studio did not answer, so the writer agent could not start. Try again in a minute.` |
 
 `CallRequested`:
 
@@ -348,9 +349,11 @@ Commands for agents: `CLAUDE.md`.
   events); projections sums them.
 - A steer or an answer is always refused (no contract event to record it
   in v0.3.0). A blocked task stays blocked: there is no resume in M2.
-- When agent-manager or prompt-studio does not answer 3 times in about
-  10 s, the run fails with `unavailable`. The owner sends the message
-  again. The ordered `CONVERSATION` consumer waits for those 10 s.
+- When agent-manager or prompt-studio does not answer 3 times, the run
+  fails with `unavailable`. One read takes up to about 12 s (3 tries of
+  2 s and waits of 2 s and 4 s), so the two reads take up to about 25 s.
+  The owner sends the message again. The ordered `CONVERSATION` consumer
+  waits for that time.
 - A call with no end is stopped only when a steer or an answer comes for
   its task after 15 minutes. There is no timer. When the answer comes
   after that stop, it is lost: the owner does not see it, and ai-proxy
