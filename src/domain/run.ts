@@ -7,6 +7,7 @@ import {
   type ErrorCode,
   type PlanSubtask,
   type RunBlockedEventPayloadV1,
+  type TaskMode,
 } from "@famashines/ai-systems-contracts";
 import {
   failedCodes,
@@ -77,6 +78,30 @@ export interface RetryDue {
   type: "RetryDue";
   subtaskId: string;
 }
+export interface ApprovePlan {
+  type: "ApprovePlan";
+  planVersion: number;
+}
+export interface EditPlan {
+  type: "EditPlan";
+  planVersion: number;
+  subtasks: PlanSubtask[];
+}
+export interface RejectPlan {
+  type: "RejectPlan";
+  planVersion: number;
+  reason: string;
+}
+export interface ReassignSubtask {
+  type: "ReassignSubtask";
+  subtaskId: string;
+  agentId: string;
+  model?: string;
+}
+export interface SetTaskMode {
+  type: "SetTaskMode";
+  mode: TaskMode;
+}
 
 export type RunCommand =
   | StartRun
@@ -87,7 +112,12 @@ export type RunCommand =
   | RetrySubtask
   | ResolveCheckpoint
   | CheckpointDue
-  | RetryDue;
+  | RetryDue
+  | ApprovePlan
+  | EditPlan
+  | RejectPlan
+  | ReassignSubtask
+  | SetTaskMode;
 
 type Of<T extends TaskEvent["type"]> = Extract<TaskEvent, { type: T }>;
 
@@ -520,7 +550,27 @@ function closeCheckpoint(
 const orchestratorCalls = (state: TaskState) =>
   runningCalls(state).filter((callId) => state.calls[callId]?.kind !== "subtask");
 
-const planOnly = new Set(["PauseRun", "ResumeRun", "RetrySubtask"]);
+const planOnly = new Set(["PauseRun", "ResumeRun", "RetrySubtask", "ReassignSubtask"]);
+
+function checkPlan(state: TaskState, planVersion: number): void {
+  if (state.status !== "awaiting_approval" || state.plan === undefined) {
+    throw new TaskConflictError("The task has no plan that waits for approval.");
+  }
+  if (state.plan.planVersion !== planVersion) {
+    throw new TaskConflictError(
+      `The plan version is ${String(state.plan.planVersion)}, not ${String(planVersion)}. Read the plan again.`,
+    );
+  }
+}
+
+function withoutEstimates(subtask: PlanSubtask): PlanSubtask {
+  const next = { ...subtask };
+  delete next.estimatedCostMicroUsd;
+  delete next.estimatedDurationMs;
+  return next;
+}
+
+const endedTask = ["new", "completed", "failed", "cancelled", "rejected"];
 
 export function decideRun(state: TaskState, command: RunCommand, env: RunEnv): TaskEvent[] {
   const { taskId } = state;
@@ -641,5 +691,63 @@ export function decideRun(state: TaskState, command: RunCommand, env: RunEnv): T
     }
     case "RetryDue":
       return [];
+    case "ApprovePlan": {
+      checkPlan(state, command.planVersion);
+      const approved = event("orchestration.PlanApproved", {
+        taskId,
+        planVersion: command.planVersion,
+      });
+      return [
+        approved,
+        ...decideRun(fold(state, [approved]), { type: "StartRun", runId: env.newId() }, env),
+      ];
+    }
+    case "EditPlan":
+      checkPlan(state, command.planVersion);
+      return [
+        event("orchestration.PlanEdited", {
+          taskId,
+          planVersion: command.planVersion + 1,
+          subtasks: command.subtasks.map(withoutEstimates),
+        }),
+      ];
+    case "RejectPlan":
+      checkPlan(state, command.planVersion);
+      return [
+        event("orchestration.PlanRejected", {
+          taskId,
+          planVersion: command.planVersion,
+          reason: reason(command.reason),
+        }),
+      ];
+    case "ReassignSubtask": {
+      const { subtaskId, agentId, model } = command;
+      if (
+        !isRunActive(state) ||
+        !hasStatus(
+          state,
+          subtaskId,
+          "waiting",
+          "queued",
+          "awaiting_approval",
+          "retrying",
+          "failed",
+          "blocked",
+        )
+      ) {
+        throw new TaskConflictError("The subtask is not in the run, or it runs or has ended.");
+      }
+      return [
+        event("orchestration.SubtaskReassigned", {
+          ...runIds(state),
+          subtaskId,
+          agentId,
+          ...optional("model", model),
+        }),
+      ];
+    }
+    case "SetTaskMode":
+      if (endedTask.includes(state.status)) throw new TaskConflictError("The task has ended.");
+      return [event("orchestration.TaskModeChanged", { taskId, mode: command.mode })];
   }
 }

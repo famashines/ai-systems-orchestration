@@ -1,10 +1,23 @@
 import {
   Actor,
+  ApprovePlanCommandPayloadV1,
+  CancelRunCommandPayloadV1,
+  CancelTaskCommandPayloadV1,
   CommandEnvelopeV1,
+  EditPlanCommandPayloadV1,
+  PauseRunCommandPayloadV1,
+  ReassignSubtaskCommandPayloadV1,
+  RejectPlanCommandPayloadV1,
+  ResolveCheckpointCommandPayloadV1,
+  ResumeRunCommandPayloadV1,
+  RetrySubtaskCommandPayloadV1,
+  SetTaskModeCommandPayloadV1,
   SubmitTaskCommandPayloadV1,
 } from "@famashines/ai-systems-contracts";
+import { bearerHook, subjectOf, type JwtVerifier } from "@famashines/ai-systems-kit/auth";
 import {
   ConflictError,
+  ForbiddenError,
   UnavailableError,
   validate,
   type Handler,
@@ -12,14 +25,34 @@ import {
 } from "@famashines/ai-systems-kit/http";
 import { isInfrastructure } from "@famashines/ai-systems-kit/messaging";
 import { z } from "zod";
-import { submitTask, type Deps } from "../application/submit-task.ts";
-import { TaskExistsError } from "../domain/task.ts";
+import { act, system, type TaskDeps } from "../application/run.ts";
+import { submitTask } from "../application/submit-task.ts";
+import { TaskConflictError, TaskExistsError, type TaskCommand } from "../domain/task.ts";
+
+const owner = Actor.extend({ kind: z.literal("owner") });
 
 const SubmitTaskBody = CommandEnvelopeV1(SubmitTaskCommandPayloadV1).extend({
   type: z.literal("orchestration.SubmitTask"),
   expectedVersion: z.literal(0).exactOptional(),
-  actor: Actor.extend({ kind: z.literal("owner") }),
+  actor: owner,
 });
+
+const ownerCommands = {
+  ApprovePlan: ApprovePlanCommandPayloadV1,
+  EditPlan: EditPlanCommandPayloadV1,
+  RejectPlan: RejectPlanCommandPayloadV1,
+  PauseRun: PauseRunCommandPayloadV1,
+  ResumeRun: ResumeRunCommandPayloadV1,
+  CancelRun: CancelRunCommandPayloadV1,
+  CancelTask: CancelTaskCommandPayloadV1,
+  RetrySubtask: RetrySubtaskCommandPayloadV1,
+  ReassignSubtask: ReassignSubtaskCommandPayloadV1,
+  SetTaskMode: SetTaskModeCommandPayloadV1,
+  ResolveCheckpoint: ResolveCheckpointCommandPayloadV1,
+};
+
+export const commandPath = (name: string): string =>
+  `/internal/commands/${name.replace(/(?<!^)[A-Z]/g, "-$&").toLowerCase()}`;
 
 const count = (fallback: string, schema: z.ZodInt) =>
   z.string().regex(/^\d+$/).default(fallback).transform(Number).pipe(schema);
@@ -30,7 +63,9 @@ const EventsQuery = z.object({
 });
 
 export function toHttpError(error: unknown): unknown {
-  if (error instanceof TaskExistsError) return new ConflictError(error.message);
+  if (error instanceof TaskExistsError || error instanceof TaskConflictError) {
+    return new ConflictError(error.message);
+  }
   if (isInfrastructure(error)) return new UnavailableError("The database is not available");
   return error;
 }
@@ -45,7 +80,38 @@ const guard =
     }
   };
 
-export function routes(deps: Deps): Route[] {
+export interface HttpDeps extends TaskDeps {
+  verify: JwtVerifier;
+}
+
+export function routes(deps: HttpDeps): Route[] {
+  const checkToken = bearerHook(deps.verify);
+  const commandRoutes = Object.entries(ownerCommands).map(([name, payload]): Route => ({
+    method: "POST",
+    path: commandPath(name),
+    handler: guard(async (request) => {
+      await checkToken(request);
+      const { body } = await validate(request, {
+        body: CommandEnvelopeV1(payload).extend({
+          type: z.literal(`orchestration.${name}`),
+          expectedVersion: z.never().exactOptional(),
+          actor: owner,
+        }),
+      });
+      if (body.actor.id !== subjectOf(request).sub) {
+        throw new ForbiddenError("The actor is not the subject of the token");
+      }
+      const { taskId, ...input } = body.payload;
+      const { answer, replayed } = await act(deps, {
+        taskId,
+        causationId: body.commandId,
+        command: { type: name, ...input } as TaskCommand,
+        actorOf: (_event, decided) => (decided ? body.actor : system),
+        idempotent: true,
+      });
+      return { status: replayed ? 200 : 201, body: answer };
+    }),
+  }));
   return [
     {
       method: "POST",
@@ -56,6 +122,7 @@ export function routes(deps: Deps): Route[] {
         return { status: replayed ? 200 : 201, body: answer };
       }),
     },
+    ...commandRoutes,
     {
       method: "GET",
       path: "/internal/events",

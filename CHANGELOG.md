@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Owner controls (task M3-04): `POST /internal/commands/<command>` for
+  `approve-plan`, `edit-plan`, `reject-plan`, `pause-run`, `resume-run`,
+  `cancel-run`, `cancel-task`, `retry-subtask`, `reassign-subtask`,
+  `set-task-mode` and `resolve-checkpoint`. Each route checks the owner
+  token before the body (ADR 0028), and `actor.id` must be the `sub`.
+  The owner is the `actor` of the events that the command decides. The
+  same `commandId` gives the first answer (200). 404 for an unknown task,
+  409 for a state that cannot take the command or an old `planVersion`.
+- New domain inputs `ApprovePlan` (then `StartRun`), `EditPlan` (the
+  next `planVersion`, the estimates of the owner dropped), `RejectPlan`,
+  `ReassignSubtask` and `SetTaskMode`.
+- New env `OIDC_ISSUER`, `OIDC_JWKS_URL`, `OIDC_AUDIENCE`. Deploy: set
+  `OIDC_JWKS_URL` to the Keycloak service, and add the egress to
+  Keycloak.
+
 - Run process manager and Task aggregate (task M3-02), contracts v0.4.1:
   all task and subtask states of the status table, `StartRun` from an
   approved plan, DAG scheduling with at most `MAX_PARALLEL_SUBTASKS`

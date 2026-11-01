@@ -1,17 +1,58 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
-import { createService } from "@famashines/ai-systems-kit/http";
+import type { JwtVerifier } from "@famashines/ai-systems-kit/auth";
+import { createService, ForbiddenError, UnauthorizedError } from "@famashines/ai-systems-kit/http";
 import { createLogger } from "@famashines/ai-systems-kit/observability";
 import { createMemoryEventStore, fakeClock, fakeIds } from "@famashines/ai-systems-kit/testing";
-import { routes } from "../../src/adapters/http.ts";
+import { commandPath, routes } from "../../src/adapters/http.ts";
+import { event, type TaskEvent } from "../../src/domain/task.ts";
 
 const clock = fakeClock();
 const store = createMemoryEventStore({ now: clock.now, newId: fakeIds(1) });
 const taskIds = fakeIds(2);
 let nextTaskId = taskIds;
+const logger = createLogger({ service: "orchestration", release: "test", level: "silent" });
+const tokens: Record<string, JwtVerifier> = {
+  owner: () => Promise.resolve({ sub: "owner-1", roles: ["owner"], exp: 0 }),
+  guest: () => Promise.reject(new ForbiddenError("The role is missing")),
+};
+const verify: JwtVerifier = (token) =>
+  (tokens[token] ?? (() => Promise.reject(new UnauthorizedError())))(token);
+const agentId = "00000000-0000-4000-8000-00000000a005";
 const app = createService({
-  logger: createLogger({ service: "orchestration", release: "test", level: "silent" }),
-  routes: routes({ store, newId: () => nextTaskId() }),
+  logger,
+  routes: routes({
+    store,
+    newId: () => nextTaskId(),
+    now: clock.now,
+    logger,
+    settings: {
+      maxParallel: 3,
+      maxCallsPerTask: 50,
+      retryDelaysMs: [5000],
+      checkpointTimeoutMs: 1,
+    },
+    loadAgent: () =>
+      Promise.resolve({
+        agent: {
+          agentId,
+          name: "writer",
+          enabled: true,
+          version: 1,
+          prompt: { promptId: agentId, version: 1 },
+          models: ["openai/gpt-4.1-nano"],
+          limits: { maxCalls: 10, maxTokens: 1000, maxCostMicroUsd: 50_000 },
+        },
+        prompt: {
+          promptId: agentId,
+          name: "writer",
+          version: 1,
+          text: "You write.",
+          variables: [],
+        },
+      }),
+    verify,
+  }),
   drainDelayMs: 0,
 });
 let base: string;
@@ -164,3 +205,174 @@ for (const query of [
     assert.equal((await events(query)).status, 400);
   });
 }
+
+const ownerPaths = [
+  "approve-plan",
+  "edit-plan",
+  "reject-plan",
+  "pause-run",
+  "resume-run",
+  "cancel-run",
+  "cancel-task",
+  "retry-subtask",
+  "reassign-subtask",
+  "set-task-mode",
+  "resolve-checkpoint",
+];
+
+test("each owner command has a kebab-case path", () => {
+  assert.equal(commandPath("ApprovePlan"), "/internal/commands/approve-plan");
+  assert.equal(commandPath("ResolveCheckpoint"), "/internal/commands/resolve-checkpoint");
+});
+
+const command = (path: string, body: unknown, token: string | null = "owner") =>
+  fetch(`${base}/internal/commands/${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(token === null ? {} : { authorization: `Bearer ${token}` }),
+    },
+    body: JSON.stringify(body),
+  });
+
+const problemOf = async (response: Response) => ({
+  status: response.status,
+  code: ((await response.json()) as { code: string }).code,
+});
+
+const seed = async (): Promise<string> => {
+  const taskId = taskIds();
+  const subtaskId = taskIds();
+  const history: TaskEvent[] = [
+    event("orchestration.TaskSubmitted", { taskId, text: "Write.", mode: "approval" }),
+    event("orchestration.PlanProposed", {
+      taskId,
+      planVersion: 1,
+      subtasks: [
+        {
+          subtaskId,
+          title: "A",
+          instructions: "Do it.",
+          agentId,
+          dependsOn: [],
+          needsApproval: false,
+        },
+      ],
+      awaitsApproval: true,
+    }),
+  ];
+  await store.append({
+    streamId: `task-${taskId}`,
+    expectedVersion: 0,
+    events: history.map((item) => ({
+      ...item,
+      correlationId: taskId,
+      causationId: taskId,
+      actor: { kind: "system", id: "test" },
+    })),
+  });
+  return taskId;
+};
+
+const approve = (taskId: string, overrides: Record<string, unknown> = {}) => ({
+  commandId: commandIds(),
+  type: "orchestration.ApprovePlan",
+  actor: owner,
+  payload: { taskId, planVersion: 1 },
+  ...overrides,
+});
+
+test("ApprovePlan gives 201, the owner is the actor of the command events, and the same commandId gives 200", async () => {
+  const taskId = await seed();
+  const body = approve(taskId);
+  const first = await command("approve-plan", body);
+  assert.equal(first.status, 201);
+  const answer = (await first.json()) as { taskId: string; version: number };
+  const stream = await store.readStream(`task-${taskId}`);
+  assert.deepEqual(answer, { taskId, version: stream.length });
+  assert.deepEqual(
+    stream.slice(2).map((item) => [item.type, item.actor.kind, item.causationId]),
+    [
+      ["orchestration.PlanApproved", "owner", body.commandId],
+      ["orchestration.RunStarted", "owner", body.commandId],
+      ["orchestration.SubtaskQueued", "owner", body.commandId],
+      ["orchestration.SubtaskStarted", "system", body.commandId],
+      ["orchestration.CallRequested", "system", body.commandId],
+    ],
+  );
+  const again = await command("approve-plan", body);
+  assert.equal(again.status, 200);
+  assert.deepEqual(await again.json(), answer);
+  assert.equal((await store.readStream(`task-${taskId}`)).length, stream.length);
+  const pause = { ...approve(taskId), type: "orchestration.PauseRun", payload: { taskId } };
+  assert.equal((await command("pause-run", pause)).status, 201);
+  assert.deepEqual(await (await command("pause-run", pause)).json(), {
+    taskId,
+    version: stream.length + 1,
+  });
+});
+
+test("each owner command checks the token before the body: 401 with no token, 403 with no owner role", async () => {
+  for (const path of ownerPaths) {
+    assert.deepEqual(await problemOf(await command(path, {}, null)), {
+      status: 401,
+      code: "unauthorized",
+    });
+    assert.deepEqual(await problemOf(await command(path, {}, "guest")), {
+      status: 403,
+      code: "forbidden",
+    });
+    assert.deepEqual(await problemOf(await command(path, {})), {
+      status: 400,
+      code: "validation_failed",
+    });
+  }
+});
+
+test("an actor that is not the subject of the token gives 403 with no event", async () => {
+  const taskId = await seed();
+  const body = approve(taskId, { actor: { kind: "owner", id: "someone-else" } });
+  assert.deepEqual(await problemOf(await command("approve-plan", body)), {
+    status: 403,
+    code: "forbidden",
+  });
+  assert.equal((await store.readStream(`task-${taskId}`)).length, 2);
+});
+
+test("a bad command body gives 400 with the path", async () => {
+  const taskId = await seed();
+  for (const [body, path] of [
+    [approve(taskId, { type: "orchestration.PauseRun" }), "body.type"],
+    [approve(taskId, { expectedVersion: 2 }), "body.expectedVersion"],
+    [approve(taskId, { actor: { kind: "system", id: "owner-1" } }), "body.actor.kind"],
+    [approve(taskId, { payload: { taskId } }), "body.payload.planVersion"],
+    [approve(taskId, { payload: { taskId: "x", planVersion: 1 } }), "body.payload.taskId"],
+  ] as const) {
+    const response = await command("approve-plan", body);
+    assert.equal(response.status, 400);
+    const problem = (await response.json()) as { errors: { path: string }[] };
+    assert.ok(
+      problem.errors.some((issue) => issue.path === path),
+      `${path} ${JSON.stringify(problem.errors)}`,
+    );
+  }
+});
+
+test("an unknown task gives 404; an old plan version or a wrong state gives 409", async () => {
+  assert.deepEqual(await problemOf(await command("approve-plan", approve(taskIds()))), {
+    status: 404,
+    code: "not_found",
+  });
+  const taskId = await seed();
+  assert.deepEqual(
+    await problemOf(
+      await command("approve-plan", approve(taskId, { payload: { taskId, planVersion: 2 } })),
+    ),
+    { status: 409, code: "conflict" },
+  );
+  const pause = { ...approve(taskId), type: "orchestration.PauseRun", payload: { taskId } };
+  const response = await command("pause-run", pause);
+  assert.equal(response.status, 409);
+  assert.equal(((await response.json()) as { detail: string }).detail, "The run is not running.");
+  assert.equal((await store.readStream(`task-${taskId}`)).length, 2);
+});

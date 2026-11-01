@@ -1,5 +1,6 @@
 import type { Actor } from "@famashines/ai-systems-contracts";
 import type { EventStore } from "@famashines/ai-systems-kit/event-store";
+import { NotFoundError } from "@famashines/ai-systems-kit/http";
 import type { ClientSession } from "mongodb";
 import type { WarnLogger } from "../adapters/writer.ts";
 import {
@@ -33,17 +34,40 @@ export interface Act {
   taskId: string;
   causationId: string;
   command: TaskCommand;
-  actorOf?: (event: TaskEvent) => Actor;
+  actorOf?: (event: TaskEvent, decided: boolean) => Actor;
   also?: (session: ClientSession) => Promise<void>;
+  idempotent?: boolean;
+}
+
+export interface Answer {
+  taskId: string;
+  version: number;
+}
+
+export interface Acted {
+  state: TaskState;
+  events: TaskEvent[];
+  answer: Answer;
+  replayed: boolean;
 }
 
 export async function act(
   deps: TaskDeps,
-  { taskId, causationId, command, actorOf = () => system, also }: Act,
-): Promise<{ state: TaskState; events: TaskEvent[] }> {
+  { taskId, causationId, command, actorOf = () => system, also, idempotent = false }: Act,
+): Promise<Acted> {
   const streamId = taskStreamId(taskId);
-  const history = (await deps.store.readStream(streamId)) as unknown as HistoryEvent[];
+  const history = (await deps.store.readStream(streamId)) as unknown as (HistoryEvent & {
+    version: number;
+    causationId: string;
+  })[];
   const state = fold(initialState, history);
+  if (idempotent) {
+    if (history.length === 0) throw new NotFoundError("The task is not known");
+    const earlier = history.findLast((stored) => stored.causationId === causationId);
+    if (earlier !== undefined) {
+      return { state, events: [], answer: { taskId, version: earlier.version }, replayed: true };
+    }
+  }
   const env: RunEnv = {
     now: deps.now(),
     newId: deps.newId,
@@ -58,19 +82,23 @@ export async function act(
     ),
   );
   const events = [...decided, ...schedule(after, { ...env, agents: new Map(loads) })];
-  if (events.length === 0) return { state, events };
-  await deps.store.append({
+  const answer = { taskId, version: history.length + events.length };
+  if (events.length === 0) return { state, events, answer, replayed: false };
+  const result = await deps.store.append({
     streamId,
     expectedVersion: history.length,
-    events: events.map((event) => ({
+    events: events.map((event, index) => ({
       ...event,
       correlationId: taskId,
       causationId,
-      actor: actorOf(event),
+      actor: actorOf(event, index < decided.length),
     })),
+    ...(idempotent ? { command: { commandId: causationId, answer } } : {}),
     ...(also === undefined ? {} : { also }),
   });
-  return { state, events };
+  return result.replayed
+    ? { state, events: [], answer: result.answer ?? answer, replayed: true }
+    : { state, events, answer, replayed: false };
 }
 
 export interface TimerEvent {
