@@ -401,8 +401,8 @@ Runaway rules (ADR 0015, base) before each try give `SubtaskBlocked`
 
 - the task made `MAX_CALLS_PER_TASK` calls (default 50);
 - the calls of the task with that agent reach `limits.maxCalls`;
-- the task cost reaches `limits.maxCostMicroUsd` (1,000,000 for a task
-  with a model).
+- the task cost reaches `limits.maxCostMicroUsd` (10,000,000 for a
+  task with a model).
 
 The rule "the same request hash 3 times in one subtask" is M4.
 
