@@ -271,9 +271,11 @@ test(
     const messages = request.body.messages as { role: string; content: string }[];
     assert.equal(messages[0]?.role, "system");
     assert.match(messages[0].content, /^You are the writer agent\./);
+    const blockId = /BEGIN DATA owner_message (\S+)\n/.exec(messages[1]?.content ?? "")?.[1];
+    assert.ok(blockId !== undefined && blockId !== messageId);
     assert.equal(
       messages[1]?.content,
-      `Answer the owner's chat message. It is in the data block below.\nBEGIN DATA owner_message ${messageId}\nWrite a haiku about the sea.\nEND DATA owner_message ${messageId}`,
+      `Answer the owner's chat message. It is in the data block below.\nBEGIN DATA owner_message ${blockId}\nWrite a haiku about the sea.\nEND DATA owner_message ${blockId}`,
     );
   },
 );

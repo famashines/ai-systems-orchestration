@@ -29,7 +29,7 @@ export async function submitTask(
     {
       now: new Date(),
       newId,
-      settings: { maxParallel: 1, retryDelaysMs: [], checkpointTimeoutMs: 0 },
+      settings: { maxParallel: 1, maxCallsPerTask: 1, retryDelaysMs: [], checkpointTimeoutMs: 0 },
       agents: new Map(),
     },
   );

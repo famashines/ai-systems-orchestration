@@ -53,6 +53,7 @@ export interface StartChatTask {
   taskId: string;
   runId: string;
   callId: string;
+  blockId: string;
   message: ChatMessage;
   writer: Writer | LoadFailure;
 }
@@ -77,14 +78,14 @@ export interface FailCall {
 export type TaskCommand =
   SubmitTask | StartChatTask | TakeMessage | CompleteCall | FailCall | RunCommand;
 
-export const dataBlock = ({ messageId, text }: ChatMessage): string =>
+export const dataBlock = (text: string, blockId: string): string =>
   [
     "Answer the owner's chat message. It is in the data block below.",
-    block("owner_message", messageId, text),
+    block("owner_message", blockId, text),
   ].join("\n");
 
 function startChatTask(command: StartChatTask): TaskEvent[] {
-  const { taskId, runId, callId, message, writer } = command;
+  const { taskId, runId, callId, blockId, message, writer } = command;
   const events: TaskEvent[] = [
     event("orchestration.TaskSubmitted", {
       taskId,
@@ -119,7 +120,7 @@ function startChatTask(command: StartChatTask): TaskEvent[] {
   }
   const messages: CallMessage[] = [
     { role: "system", content: prompt.text },
-    { role: "user", content: dataBlock(message) },
+    { role: "user", content: dataBlock(message.text, blockId) },
   ];
   return [
     ...events,

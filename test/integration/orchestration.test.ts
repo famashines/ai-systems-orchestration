@@ -372,11 +372,14 @@ test("a new_task message runs the writer: TaskSubmitted, RunStarted, CallRequest
   });
   const call = events[2]?.payload ?? {};
   assert.equal(call.maxCostMicroUsd, 50_000);
+  const [, user] = call.messages as { content: string }[];
+  const blockId = /BEGIN DATA owner_message (\S+)\n/.exec(user?.content ?? "")?.[1];
+  assert.ok(blockId !== undefined && blockId !== messageId);
   assert.deepEqual(call.messages, [
     { role: "system", content: "You are the writer agent." },
     {
       role: "user",
-      content: `Answer the owner's chat message. It is in the data block below.\nBEGIN DATA owner_message ${messageId}\nWrite a poem\nEND DATA owner_message ${messageId}`,
+      content: `Answer the owner's chat message. It is in the data block below.\nBEGIN DATA owner_message ${blockId}\nWrite a poem\nEND DATA owner_message ${blockId}`,
     },
   ]);
   await published(String(events[2]?._id));

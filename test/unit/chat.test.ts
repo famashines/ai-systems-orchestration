@@ -70,7 +70,12 @@ const setup = (loadWriter: ChatDeps["loadWriter"] = () => Promise.resolve(writer
     loadAgent: () => Promise.resolve(writer),
     now: () => new Date(),
     logger,
-    settings: { maxParallel: 3, retryDelaysMs: [5000, 30000], checkpointTimeoutMs: 60_000 },
+    settings: {
+      maxParallel: 3,
+      maxCallsPerTask: 50,
+      retryDelaysMs: [5000, 30000],
+      checkpointTimeoutMs: 60_000,
+    },
   };
   return { store, deps };
 };

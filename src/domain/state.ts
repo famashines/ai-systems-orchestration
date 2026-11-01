@@ -60,6 +60,7 @@ export interface CallState {
   kind?: CallKind;
   subtaskId?: string;
   agentId: string;
+  maxCostMicroUsd?: number;
   settled: boolean;
   cancelRequested: boolean;
 }
@@ -340,11 +341,12 @@ export function evolve(state: TaskState, event: HistoryEvent): TaskState {
     case "orchestration.RunCancelled":
       return endRun(state, "cancelled");
     case "orchestration.CallRequested": {
-      const { callId, kind, subtaskId, agentId } = event.payload;
+      const { callId, kind, subtaskId, agentId, maxCostMicroUsd } = event.payload;
       const calls = {
         ...state.calls,
         [callId]: {
           agentId,
+          ...(maxCostMicroUsd === undefined ? {} : { maxCostMicroUsd }),
           settled: false,
           cancelRequested: false,
           ...(kind === undefined ? {} : { kind }),

@@ -24,10 +24,11 @@ export async function onOwnerMessage(
     const taskId = deps.newId();
     const runId = deps.newId();
     const callId = deps.newId();
+    const blockId = deps.newId();
     await act(deps, {
       taskId,
       causationId: event.eventId,
-      command: { type: "StartChatTask", taskId, runId, callId, message, writer },
+      command: { type: "StartChatTask", taskId, runId, callId, blockId, message, writer },
       actorOf: (created) => (created.type === "orchestration.TaskSubmitted" ? event.actor : system),
       also: markProcessed,
     });

@@ -41,6 +41,7 @@ export const envSchema = commonEnv.omit({ SERVICE_NAME: true }).extend({
   AGENT_MANAGER_URL: httpUrl.default("http://ai-systems-agent-manager:8080"),
   PROMPT_STUDIO_URL: httpUrl.default("http://ai-systems-prompt-studio:8080"),
   MAX_PARALLEL_SUBTASKS: int("3", z.int().min(1).max(20)),
+  MAX_CALLS_PER_TASK: int("50", z.int().min(1).max(1000)),
   SUBTASK_RETRY_DELAYS_MS: z
     .string()
     .regex(/^\d+,\d+$/)
@@ -95,6 +96,7 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
     logger,
     settings: {
       maxParallel: config.MAX_PARALLEL_SUBTASKS,
+      maxCallsPerTask: config.MAX_CALLS_PER_TASK,
       retryDelaysMs: config.SUBTASK_RETRY_DELAYS_MS,
       checkpointTimeoutMs: config.CHECKPOINT_TIMEOUT_MS,
     },

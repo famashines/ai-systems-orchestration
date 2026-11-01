@@ -30,6 +30,11 @@ interface TimerDoc extends TimerEvent {
   payload: TimerEvent["payload"] & { retryAt?: string; deadline?: string };
 }
 
+export const windowStart = (since: string, at: Date): string =>
+  at.getTime() < Date.parse(since) + marginMs
+    ? new Date(at.getTime() - marginMs).toISOString()
+    : since;
+
 export interface TimersOptions {
   db: Db;
   intervalMs: number;
@@ -55,6 +60,7 @@ export function startTimers({
 
   async function poll(): Promise<void> {
     const at = now();
+    since = windowStart(since, at);
     const until = at.toISOString();
     const due = await events
       .find(
