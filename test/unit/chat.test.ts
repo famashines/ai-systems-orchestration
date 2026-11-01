@@ -5,7 +5,8 @@ import { test } from "node:test";
 import type { RegisteredEvent } from "@famashines/ai-systems-contracts";
 import type { HandlerContext } from "@famashines/ai-systems-kit/messaging";
 import { createMemoryEventStore, fakeIds } from "@famashines/ai-systems-kit/testing";
-import { ReadFailedError, writerLoader } from "../../src/adapters/writer.ts";
+import { agentByIdLoader, ReadFailedError, writerLoader } from "../../src/adapters/writer.ts";
+import { onTimer } from "../../src/application/run.ts";
 import { onLlmEvent, onOwnerMessage, type ChatDeps } from "../../src/application/chat.ts";
 import type { Writer } from "../../src/domain/task.ts";
 
@@ -62,7 +63,20 @@ const logger = {
 
 const setup = (loadWriter: ChatDeps["loadWriter"] = () => Promise.resolve(writer)) => {
   const store = createMemoryEventStore({ newId: fakeIds(1) });
-  const deps: ChatDeps = { store, newId: fakeIds(2), loadWriter, now: () => new Date(), logger };
+  const deps: ChatDeps = {
+    store,
+    newId: fakeIds(2),
+    loadWriter,
+    loadAgent: () => Promise.resolve(writer),
+    now: () => new Date(),
+    logger,
+    settings: {
+      maxParallel: 3,
+      maxCallsPerTask: 50,
+      retryDelaysMs: [5000, 30000],
+      checkpointTimeoutMs: 60_000,
+    },
+  };
   return { store, deps };
 };
 
@@ -325,4 +339,107 @@ test("writerLoader gives internal with no retry for a 4xx that is not 404", asyn
     assert.equal(attempts, 1);
     assert.equal(err.status, Object.values(routes).at(-1)?.[0]);
   }
+});
+
+test("agentByIdLoader reads the active version of an agent by id, and refuses another agent", async (t) => {
+  const { agentId } = writer.agent;
+  const byId = `/internal/agents/${agentId}/active-version`;
+  const server = await serve({ [byId]: [200, writer.agent], [promptPath]: [200, writer.prompt] });
+  t.after(server.close);
+  const load = agentByIdLoader({
+    agentManagerUrl: server.url,
+    promptStudioUrl: server.url,
+    logger,
+  });
+  assert.deepEqual(await load(agentId), writer);
+  const other = "00000000-0000-4000-8000-00000000a009";
+  assert.deepEqual(await load(other), {
+    code: "not_found",
+    reason: `The subtask agent ${other} has no active version.`,
+  });
+  const wrong = await serve({ [`/internal/agents/${other}/active-version`]: [200, writer.agent] });
+  t.after(wrong.close);
+  const loadWrong = agentByIdLoader({
+    agentManagerUrl: wrong.url,
+    promptStudioUrl: wrong.url,
+    logger,
+  });
+  assert.deepEqual(await loadWrong(other), {
+    code: "internal",
+    reason: `agent-manager gave a subtask agent ${other} that is not valid.`,
+  });
+});
+
+test("onTimer starts a due retry in one append with the marker, and gives false when the timer has nothing to do", async () => {
+  const { store, deps } = setup();
+  const taskId = "00000000-0000-4000-8000-0000000000aa";
+  const runId = "00000000-0000-4000-8000-0000000000ab";
+  const subtaskId = "00000000-0000-4000-8000-0000000000ac";
+  const ids = { taskId, runId, subtaskId };
+  const subtask = {
+    subtaskId,
+    title: "Step",
+    instructions: "Do it.",
+    agentId: writer.agent.agentId,
+    dependsOn: [],
+    needsApproval: false,
+  };
+  const now = deps.now();
+  const history = [
+    ["orchestration.TaskSubmitted", { taskId, text: "Report", mode: "auto" }],
+    [
+      "orchestration.PlanProposed",
+      { taskId, planVersion: 1, subtasks: [subtask], awaitsApproval: false },
+    ],
+    ["orchestration.PlanApproved", { taskId, planVersion: 1 }],
+    ["orchestration.RunStarted", { taskId, runId }],
+    ["orchestration.SubtaskQueued", ids],
+    [
+      "orchestration.SubtaskFailed",
+      {
+        ...ids,
+        tryNumber: 1,
+        code: "unavailable",
+        reason: "x",
+        inputTokens: 0,
+        outputTokens: 0,
+        costMicroUsd: 0,
+      },
+    ],
+    ["orchestration.SubtaskRetrying", { ...ids, tryNumber: 2, retryAt: now.toISOString() }],
+  ] as const;
+  await store.append({
+    streamId: `task-${taskId}`,
+    events: history.map(([type, payload]) => ({
+      type,
+      schemaVersion: 1,
+      payload,
+      correlationId: taskId,
+      causationId: taskId,
+      actor: owner,
+    })) as never,
+  });
+  const timer = { _id: ids.runId, type: "orchestration.SubtaskRetrying", payload: ids };
+  let marked = 0;
+  const also = () => {
+    marked += 1;
+    return Promise.resolve();
+  };
+  assert.equal(await onTimer(deps, timer, also), true);
+  assert.equal(marked, 1);
+  const stream = await store.readStream(`task-${taskId}`);
+  assert.deepEqual(
+    stream.slice(-2).map((item) => [item.type, item.causationId]),
+    [
+      ["orchestration.SubtaskStarted", ids.runId],
+      ["orchestration.CallRequested", ids.runId],
+    ],
+  );
+  const due = {
+    ...timer,
+    type: "orchestration.CheckpointOpened",
+    payload: { ...ids, checkpointId: runId },
+  };
+  assert.equal(await onTimer(deps, due, also), false);
+  assert.equal(marked, 1);
 });

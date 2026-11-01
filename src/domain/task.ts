@@ -1,36 +1,39 @@
 import type {
-  ActiveAgentVersionResultV1,
-  AgentLimits,
   CallCompletedEventPayloadV1,
   CallFailedEventPayloadV1,
   CallMessage,
-  CallRequestedEventPayloadV1,
   ErrorCode,
-  LlmErrorClass,
-  MessageRefusedEventPayloadV1,
-  PromptVersionResultV1,
-  RunBlockedEventPayloadV1,
-  RunCompletedEventPayloadV1,
-  RunFailedEventPayloadV1,
-  RunStartedEventPayloadV1,
   TaskMode,
-  TaskSubmittedEventPayloadV1,
 } from "@famashines/ai-systems-contracts";
+import {
+  block,
+  callDurationMs,
+  decideRun,
+  event,
+  notStarted,
+  settleCall,
+  type RunCommand,
+  type RunEnv,
+} from "./run.ts";
+import {
+  failedCodes,
+  isRunActive,
+  nextCall,
+  reason,
+  runningCalls,
+  TaskExistsError,
+  type LoadFailure,
+  type TaskEvent,
+  type TaskState,
+  type Writer,
+} from "./state.ts";
 
-export const callDurationMs = 120_000;
+export * from "./state.ts";
+export * from "./run.ts";
+
 export const staleAfterMs = 15 * 60_000;
 export const staleReason =
   "The answer did not come in 15 minutes, so the task stopped. A later answer is not shown, and its cost is still booked.";
-
-export interface Writer {
-  agent: ActiveAgentVersionResultV1;
-  prompt: PromptVersionResultV1;
-}
-
-export interface LoadFailure {
-  code: ErrorCode;
-  reason: string;
-}
 
 export interface ChatMessage {
   conversationId: string;
@@ -50,16 +53,16 @@ export interface StartChatTask {
   taskId: string;
   runId: string;
   callId: string;
+  blockId: string;
   message: ChatMessage;
   writer: Writer | LoadFailure;
 }
 
-export interface RefuseMessage {
-  type: "RefuseMessage";
+export interface TakeMessage {
+  type: "TakeMessage";
   taskId: string;
   message: ChatMessage;
   intent: "steer" | "answer";
-  now: Date;
 }
 
 export interface CompleteCall {
@@ -72,98 +75,30 @@ export interface FailCall {
   call: CallFailedEventPayloadV1;
 }
 
-export type TaskCommand = SubmitTask | StartChatTask | RefuseMessage | CompleteCall | FailCall;
+export type TaskCommand =
+  SubmitTask | StartChatTask | TakeMessage | CompleteCall | FailCall | RunCommand;
 
-type Event<T extends string, P> = { type: T; schemaVersion: 1; payload: P };
-
-export type TaskEvent =
-  | Event<"orchestration.TaskSubmitted", TaskSubmittedEventPayloadV1>
-  | Event<"orchestration.RunStarted", RunStartedEventPayloadV1>
-  | Event<"orchestration.CallRequested", CallRequestedEventPayloadV1>
-  | Event<"orchestration.RunCompleted", RunCompletedEventPayloadV1>
-  | Event<"orchestration.RunFailed", RunFailedEventPayloadV1>
-  | Event<"orchestration.RunBlocked", RunBlockedEventPayloadV1>
-  | Event<"orchestration.MessageRefused", MessageRefusedEventPayloadV1>;
-
-export type TaskStatus = "new" | "submitted" | "running" | "blocked" | "completed" | "failed";
-
-export interface TaskState {
-  status: TaskStatus;
-  runId?: string;
-  callId?: string;
-  calledAt?: string;
-  reason?: string;
-}
-
-export class TaskExistsError extends Error {
-  constructor() {
-    super("The task exists");
-    this.name = "TaskExistsError";
-  }
-}
-
-export const initialState: TaskState = { status: "new" };
-
-export const taskStreamId = (taskId: string): string => `task-${taskId}`;
-
-const reason = (text: string): string => text.slice(0, 1000);
-
-export const dataBlock = ({ messageId, text }: ChatMessage): string =>
+export const dataBlock = (text: string, blockId: string): string =>
   [
     "Answer the owner's chat message. It is in the data block below.",
-    `BEGIN DATA owner_message ${messageId}`,
-    text,
-    `END DATA owner_message ${messageId}`,
+    block("owner_message", blockId, text),
   ].join("\n");
 
-export type NextCall = { maxCostMicroUsd: number } | { stop: string };
-
-export function nextCall(
-  limits: AgentLimits,
-  used: { calls: number; costMicroUsd: number },
-): NextCall {
-  if (used.calls >= limits.maxCalls) {
-    return { stop: `The task made ${String(used.calls)} calls, the limit of the agent.` };
-  }
-  const rest = limits.maxCostMicroUsd - used.costMicroUsd;
-  if (rest <= 0) {
-    return {
-      stop: `The task used ${String(used.costMicroUsd)} of its ${String(limits.maxCostMicroUsd)} micro-USD allowance.`,
-    };
-  }
-  return { maxCostMicroUsd: rest };
-}
-
-const failedCodes: Record<Exclude<LlmErrorClass, "budget_refused">, ErrorCode> = {
-  rate_limit: "rate_limited",
-  timeout: "unavailable",
-  provider: "unavailable",
-  invalid: "internal",
-};
-
 function startChatTask(command: StartChatTask): TaskEvent[] {
-  const { taskId, runId, callId, message, writer } = command;
+  const { taskId, runId, callId, blockId, message, writer } = command;
   const events: TaskEvent[] = [
-    {
-      type: "orchestration.TaskSubmitted",
-      schemaVersion: 1,
-      payload: {
-        taskId,
-        text: message.text,
-        mode: "auto",
-        conversationId: message.conversationId,
-        messageId: message.messageId,
-      },
-    },
-    { type: "orchestration.RunStarted", schemaVersion: 1, payload: { taskId, runId } },
+    event("orchestration.TaskSubmitted", {
+      taskId,
+      text: message.text,
+      mode: "auto",
+      conversationId: message.conversationId,
+      messageId: message.messageId,
+    }),
+    event("orchestration.RunStarted", { taskId, runId }),
   ];
   const failed = (code: ErrorCode, text: string): TaskEvent[] => [
     ...events,
-    {
-      type: "orchestration.RunFailed",
-      schemaVersion: 1,
-      payload: { taskId, runId, code, reason: reason(text) },
-    },
+    event("orchestration.RunFailed", { taskId, runId, code, reason: reason(text) }),
   ];
   if (!("agent" in writer)) return failed(writer.code, writer.reason);
   const { agent, prompt } = writer;
@@ -175,90 +110,101 @@ function startChatTask(command: StartChatTask): TaskEvent[] {
   if ("stop" in next) {
     return [
       ...events,
-      {
-        type: "orchestration.RunBlocked",
-        schemaVersion: 1,
-        payload: { taskId, runId, code: "runaway_stopped", reason: reason(next.stop) },
-      },
+      event("orchestration.RunBlocked", {
+        taskId,
+        runId,
+        code: "runaway_stopped",
+        reason: reason(next.stop),
+      }),
     ];
   }
   const messages: CallMessage[] = [
     { role: "system", content: prompt.text },
-    { role: "user", content: dataBlock(message) },
+    { role: "user", content: dataBlock(message.text, blockId) },
   ];
   return [
     ...events,
-    {
-      type: "orchestration.CallRequested",
-      schemaVersion: 1,
-      payload: {
-        taskId,
-        callId,
-        agentId: agent.agentId,
-        agentVersion: agent.version,
-        messages,
-        models: agent.models,
-        maxTokens: agent.limits.maxTokens,
-        maxDurationMs: callDurationMs,
-        maxCostMicroUsd: next.maxCostMicroUsd,
-      },
-    },
+    event("orchestration.CallRequested", {
+      taskId,
+      callId,
+      agentId: agent.agentId,
+      agentVersion: agent.version,
+      messages,
+      models: agent.models,
+      maxTokens: agent.limits.maxTokens,
+      maxDurationMs: callDurationMs,
+      maxCostMicroUsd: next.maxCostMicroUsd,
+    }),
   ];
 }
 
-function refusal(state: TaskState, command: RefuseMessage): string {
+function refusal(state: TaskState, intent: "steer" | "answer"): string {
   if (state.status === "new") return "The task is not known.";
-  if (command.intent === "answer") return "The task has no open question.";
+  if (intent === "answer") return "The task has no open question.";
+  if (state.plan !== undefined && isRunActive(state)) {
+    return "All subtasks of the run have started, so the message cannot change the run. Send the message as a new task.";
+  }
   switch (state.status) {
     case "running":
+    case "paused":
       return "The task is running and cannot take a message now. Wait for the answer, or send the message as a new task.";
     case "blocked":
       return `The task is blocked until the owner acts. Send the message as a new task. The reason: ${state.reason ?? "not known"}`;
     case "submitted":
-      return "The task does not run in the chat. Send the message as a new task.";
+    case "clarifying":
+    case "planning":
+    case "awaiting_approval":
+      return state.conversationId === undefined
+        ? "The task does not run in the chat. Send the message as a new task."
+        : "The task has not started its run yet. Wait for the plan or the questions.";
     default:
       return "The task has ended. Send the message as a new task.";
   }
 }
 
-function refuseMessage(state: TaskState, command: RefuseMessage): TaskEvent[] {
-  const { taskId, message, intent, now } = command;
+function takeMessage(state: TaskState, command: TakeMessage, env: RunEnv): TaskEvent[] {
+  const { taskId, message, intent } = command;
+  if (intent === "steer" && state.runId !== undefined && isRunActive(state) && notStarted(state)) {
+    return [
+      event("orchestration.SteeringMessageAdded", { taskId, ...message, runId: state.runId }),
+    ];
+  }
   const events: TaskEvent[] = [];
   let current = state;
   if (
+    state.plan === undefined &&
     state.status === "running" &&
     state.runId !== undefined &&
     state.calledAt !== undefined &&
-    now.getTime() - Date.parse(state.calledAt) > staleAfterMs
+    env.now.getTime() - Date.parse(state.calledAt) > staleAfterMs
   ) {
-    events.push({
-      type: "orchestration.RunFailed",
-      schemaVersion: 1,
-      payload: {
+    events.push(
+      event("orchestration.RunFailed", {
         taskId,
         runId: state.runId,
         code: "unavailable",
         reason: staleReason,
-      },
-    });
-    current = { status: "failed" };
+      }),
+      ...runningCalls(state).map((callId) =>
+        event("orchestration.CallCancelRequested", { taskId, callId }),
+      ),
+    );
+    current = { ...state, status: "failed" };
   }
-  events.push({
-    type: "orchestration.MessageRefused",
-    schemaVersion: 1,
-    payload: {
+  events.push(
+    event("orchestration.MessageRefused", {
       taskId,
       conversationId: message.conversationId,
       messageId: message.messageId,
       intent,
-      reason: reason(refusal(current, command)),
-    },
-  });
+      reason: reason(refusal(current, intent)),
+    }),
+  );
   return events;
 }
 
 export const isClosed = (state: TaskState): boolean =>
-  state.status === "completed" || state.status === "failed" || state.status === "blocked";
+  ["completed", "failed", "blocked", "cancelled", "rejected"].includes(state.status);
 
 const isCurrent = (state: TaskState, callId: string): state is TaskState & { runId: string } =>
   state.status === "running" && state.callId === callId && state.runId !== undefined;
@@ -269,19 +215,21 @@ function completeCall(state: TaskState, { call }: CompleteCall): TaskEvent[] {
   const { runId } = state;
   if (call.text.trim() === "") {
     return [
-      {
-        type: "orchestration.RunFailed",
-        schemaVersion: 1,
-        payload: { taskId, runId, code: "empty_output", reason: "The model gave an empty answer." },
-      },
+      event("orchestration.RunFailed", {
+        taskId,
+        runId,
+        code: "empty_output",
+        reason: "The model gave an empty answer.",
+      }),
     ];
   }
   return [
-    {
-      type: "orchestration.RunCompleted",
-      schemaVersion: 1,
-      payload: { taskId, runId, summary: call.text, costMicroUsd: call.costMicroUsd },
-    },
+    event("orchestration.RunCompleted", {
+      taskId,
+      runId,
+      summary: call.text,
+      costMicroUsd: call.costMicroUsd,
+    }),
   ];
 }
 
@@ -291,74 +239,41 @@ function failCall(state: TaskState, { call }: FailCall): TaskEvent[] {
   const { runId } = state;
   if (call.errorClass === "budget_refused") {
     return [
-      {
-        type: "orchestration.RunBlocked",
-        schemaVersion: 1,
-        payload: {
-          taskId,
-          runId,
-          code: "budget_refused",
-          reason: reason(`The budget refused the call: ${call.reason}`),
-        },
-      },
+      event("orchestration.RunBlocked", {
+        taskId,
+        runId,
+        code: "budget_refused",
+        reason: reason(`The budget refused the call: ${call.reason}`),
+      }),
     ];
   }
   return [
-    {
-      type: "orchestration.RunFailed",
-      schemaVersion: 1,
-      payload: {
-        taskId,
-        runId,
-        code: failedCodes[call.errorClass],
-        reason: reason(`The model call failed: ${call.reason}`),
-      },
-    },
+    event("orchestration.RunFailed", {
+      taskId,
+      runId,
+      code: failedCodes[call.errorClass],
+      reason: reason(`The model call failed: ${call.reason}`),
+    }),
   ];
 }
 
-export function decide(state: TaskState, command: TaskCommand): TaskEvent[] {
+export function decide(state: TaskState, command: TaskCommand, env: RunEnv): TaskEvent[] {
   switch (command.type) {
     case "SubmitTask": {
       if (state.status !== "new") throw new TaskExistsError();
       const { taskId, text, mode } = command;
-      return [
-        { type: "orchestration.TaskSubmitted", schemaVersion: 1, payload: { taskId, text, mode } },
-      ];
+      return [event("orchestration.TaskSubmitted", { taskId, text, mode })];
     }
     case "StartChatTask":
       if (state.status !== "new") throw new TaskExistsError();
       return startChatTask(command);
-    case "RefuseMessage":
-      return refuseMessage(state, command);
+    case "TakeMessage":
+      return takeMessage(state, command, env);
     case "CompleteCall":
-      return completeCall(state, command);
+      return settleCall(state, { completed: command.call }, env) ?? completeCall(state, command);
     case "FailCall":
-      return failCall(state, command);
-  }
-}
-
-export function evolve(state: TaskState, event: TaskEvent & { occurredAt?: string }): TaskState {
-  switch (event.type) {
-    case "orchestration.TaskSubmitted":
-      return { status: "submitted" };
-    case "orchestration.RunStarted":
-      return { status: "running", runId: event.payload.runId };
-    case "orchestration.CallRequested":
-      return {
-        ...state,
-        callId: event.payload.callId,
-        ...(event.occurredAt === undefined ? {} : { calledAt: event.occurredAt }),
-      };
-    case "orchestration.RunCompleted":
-      return { status: "completed" };
-    case "orchestration.RunFailed":
-      return { status: "failed" };
-    case "orchestration.RunBlocked":
-      return { status: "blocked", reason: event.payload.reason };
-    case "orchestration.MessageRefused":
-      return state;
+      return settleCall(state, { failed: command.call }, env) ?? failCall(state, command);
     default:
-      throw new Error(`Unknown event type ${(event as { type: string }).type}`);
+      return decideRun(state, command, env);
   }
 }
