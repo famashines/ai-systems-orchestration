@@ -501,7 +501,10 @@ and an admin user that makes the streams.
   prompt-studio reads (`ActiveAgentVersionResultV1`,
   `PromptVersionResultV1`). The test publishes
   `conversation.OwnerMessagePosted` and `llm.*` itself as the admin user,
-  in place of conversation-hub and ai-proxy.
+  in place of conversation-hub and ai-proxy. The fake also gives the read
+  of an agent by id. A planned run test appends a task stream with a due
+  `SubtaskRetrying`: the timer loop starts the try, and the test ends the
+  subtask calls with `llm.CallCompleted` until `RunCompleted`.
 - `test:e2e`: nothing of orchestration is faked. It clones budget,
   agent-manager, prompt-studio and ai-proxy at fixed `main` commits into
   `E2E_DIR` (it reuses a clone that is there and fetches the commit), runs `npm ci`, and starts
