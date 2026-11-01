@@ -13,6 +13,11 @@
 - New domain inputs `ApprovePlan` (then `StartRun`), `EditPlan` (the
   next `planVersion`, the estimates of the owner dropped), `RejectPlan`,
   `ReassignSubtask` and `SetTaskMode`.
+- `POST /internal/commands/submit-task` checks the owner token too
+  (ADR 0028), and `actor.id` must be the `sub`. Deploy the api-gateway
+  version that forwards `Authorization` on `POST /api/tasks` first.
+- An owner command reads and decides again after a `ConcurrencyError`,
+  at most 3 times, before it gives 409.
 - New env `OIDC_ISSUER`, `OIDC_JWKS_URL`, `OIDC_AUDIENCE`. Deploy: set
   `OIDC_JWKS_URL` to the Keycloak service, and add the egress to
   Keycloak.

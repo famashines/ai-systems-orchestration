@@ -15,17 +15,19 @@ import {
   SubmitTaskCommandPayloadV1,
 } from "@famashines/ai-systems-contracts";
 import { bearerHook, subjectOf, type JwtVerifier } from "@famashines/ai-systems-kit/auth";
+import { ConcurrencyError } from "@famashines/ai-systems-kit/event-store";
 import {
   ConflictError,
   ForbiddenError,
   UnavailableError,
   validate,
   type Handler,
+  type Request,
   type Route,
 } from "@famashines/ai-systems-kit/http";
 import { isInfrastructure } from "@famashines/ai-systems-kit/messaging";
 import { z } from "zod";
-import { act, system, type TaskDeps } from "../application/run.ts";
+import { act, system, type Act, type TaskDeps } from "../application/run.ts";
 import { submitTask } from "../application/submit-task.ts";
 import { TaskConflictError, TaskExistsError, type TaskCommand } from "../domain/task.ts";
 
@@ -84,6 +86,24 @@ export interface HttpDeps extends TaskDeps {
   verify: JwtVerifier;
 }
 
+const concurrencyTries = 3;
+
+async function actAgain(deps: TaskDeps, input: Act) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await act(deps, input);
+    } catch (error) {
+      if (!(error instanceof ConcurrencyError) || attempt === concurrencyTries) throw error;
+    }
+  }
+}
+
+function checkActor(request: Request, actor: { id: string }): void {
+  if (actor.id !== subjectOf(request).sub) {
+    throw new ForbiddenError("The actor is not the subject of the token");
+  }
+}
+
 export function routes(deps: HttpDeps): Route[] {
   const checkToken = bearerHook(deps.verify);
   const commandRoutes = Object.entries(ownerCommands).map(([name, payload]): Route => ({
@@ -98,11 +118,9 @@ export function routes(deps: HttpDeps): Route[] {
           actor: owner,
         }),
       });
-      if (body.actor.id !== subjectOf(request).sub) {
-        throw new ForbiddenError("The actor is not the subject of the token");
-      }
+      checkActor(request, body.actor);
       const { taskId, ...input } = body.payload;
-      const { answer, replayed } = await act(deps, {
+      const { answer, replayed } = await actAgain(deps, {
         taskId,
         causationId: body.commandId,
         command: { type: name, ...input } as TaskCommand,
@@ -117,7 +135,9 @@ export function routes(deps: HttpDeps): Route[] {
       method: "POST",
       path: "/internal/commands/submit-task",
       handler: guard(async (request) => {
+        await checkToken(request);
         const { body } = await validate(request, { body: SubmitTaskBody });
+        checkActor(request, body.actor);
         const { answer, replayed } = await submitTask(deps, body);
         return { status: replayed ? 200 : 201, body: answer };
       }),

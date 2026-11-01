@@ -45,7 +45,7 @@ test("SubmitTask gives 503 with no detail when MongoDB is down", async () => {
   await expectUnavailable(
     await fetch(`${base}/internal/commands/submit-task`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization: "Bearer owner" },
       body: JSON.stringify({
         commandId: "00000000-0000-4000-8000-000000000002",
         type: "orchestration.SubmitTask",

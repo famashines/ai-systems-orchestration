@@ -21,7 +21,7 @@ routes `POST /internal/commands/<command>` (see
 that section too.
 
 ```
-api-gateway --POST /internal/commands/submit-task--> orchestration
+api-gateway --POST /internal/commands/submit-task (Authorization)--> orchestration
 api-gateway --POST /internal/commands/<owner command> (Authorization)--> orchestration --JWKS--> Keycloak
 conversation-hub --conversation.OwnerMessagePosted (CONVERSATION)--> orchestration
 orchestration --GET /internal/agents/by-name/writer/active-version--> agent-manager
@@ -400,7 +400,7 @@ replay the DLQ after the rollout.
 
 | Method | Path                                           | Does                                                                                                                                   |
 | ------ | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| POST   | `/internal/commands/submit-task`               | Submit a new task                                                                                                                      |
+| POST   | `/internal/commands/submit-task`               | Submit a new task. Needs an owner bearer token                                                                                         |
 | POST   | `/internal/commands/<command>`                 | An owner command (below). Needs an owner bearer token                                                                                  |
 | GET    | `/internal/events?afterPosition=<n>&limit=<m>` | Replay API: all events in position order                                                                                               |
 | GET    | `/health`                                      | Liveness: 200 while the process runs                                                                                                   |
@@ -418,7 +418,7 @@ The body is a `CommandEnvelopeV1` with a `SubmitTaskCommandPayloadV1`
 {
   "commandId": "6f1c2b9e-1d1a-4c55-9b0e-3a7f0d5e8c21",
   "type": "orchestration.SubmitTask",
-  "actor": { "kind": "owner", "id": "<owner id>" },
+  "actor": { "kind": "owner", "id": "<sub of the token>" },
   "payload": { "text": "Write a poem", "mode": "auto" }
 }
 ```
@@ -427,7 +427,11 @@ The body is a `CommandEnvelopeV1` with a `SubmitTaskCommandPayloadV1`
   takes it from the `Idempotency-Key` header.
 - `type` must be `orchestration.SubmitTask`.
 - `expectedVersion` is optional. If it is there, it must be `0`.
-- `actor.kind` must be `owner` in M1. api-gateway sends the owner.
+- The request needs `Authorization: Bearer <access token>`, checked
+  before the body, the same as the [owner commands](#owner-commands). A
+  task can start a paid plan call (ADR 0028).
+- `actor.kind` must be `owner`, and `actor.id` must be the `sub` of the
+  token.
 - `mode` is `auto` or `approval` (the default).
 
 | Status   | When                                | Body                                             |
@@ -435,6 +439,8 @@ The body is a `CommandEnvelopeV1` with a `SubmitTaskCommandPayloadV1`
 | 201      | A new task                          | `{ "taskId": "<uuid>", "version": 1 }`           |
 | 200      | The same `commandId` came before    | The first answer again. No new event.            |
 | 400      | The body is not valid               | Problem JSON with `errors` (paths, never values) |
+| 401      | No token, or a token not valid      | Problem JSON                                     |
+| 403      | No `owner` role, or another `sub`   | Problem JSON                                     |
 | 409      | The stream exists (a task id clash) | Problem JSON, `code` `conflict`                  |
 | 413, 415 | The body is too large, or not JSON  | Problem JSON                                     |
 | 503      | MongoDB does not answer in 5 s      | Problem JSON, `code` `unavailable`, no detail    |
@@ -488,6 +494,11 @@ in kebab case:
   changed after the first command. The append also stores the `commandId`
   in `commands` (kit), so two requests with the same `commandId` at the
   same time give one append.
+- A 409 is not stored. So it is safe to send the same `commandId` again
+  after a 409: the route decides again with the state of that time.
+- A concurrent append to the task (for example an `llm.*` event of the
+  run) gives a `ConcurrencyError`. The route then reads the task and
+  decides again, at most 3 times in total, before it gives 409.
 - The events that the command decides (for example `PlanApproved`,
   `RunStarted` and `SubtaskQueued` of `ApprovePlan`) have the owner as
   `actor`. The events that follow from the run (`SubtaskStarted`,
@@ -499,17 +510,17 @@ in kebab case:
   or not known fails its try when it starts (no retry), and the owner can
   reassign it.
 
-| Status | When                                                                                        | Body                                          |
-| ------ | ------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| 201    | The command is done                                                                         | `{ "taskId": "<uuid>", "version": <n> }`      |
-| 200    | The same `commandId` came before                                                            | The first answer again. No new event.         |
-| 400    | The body is not valid                                                                       | Problem JSON with `errors` (paths, no values) |
-| 401    | No token, or a token that is not valid                                                      | Problem JSON                                  |
-| 403    | No `owner` role, or `actor.id` is not the `sub` of the token                                | Problem JSON                                  |
-| 404    | The task is not known                                                                       | Problem JSON, `code` `not_found`              |
-| 409    | The state cannot take the command, an old `planVersion`, or a concurrent append to the task | Problem JSON, `code` `conflict`, the reason   |
-| 413    | The body is too large                                                                       | Problem JSON                                  |
-| 503    | MongoDB does not answer, or Keycloak cannot be read                                         | Problem JSON, `code` `unavailable`            |
+| Status | When                                                                             | Body                                          |
+| ------ | -------------------------------------------------------------------------------- | --------------------------------------------- |
+| 201    | The command is done                                                              | `{ "taskId": "<uuid>", "version": <n> }`      |
+| 200    | The same `commandId` came before                                                 | The first answer again. No new event.         |
+| 400    | The body is not valid                                                            | Problem JSON with `errors` (paths, no values) |
+| 401    | No token, or a token that is not valid                                           | Problem JSON                                  |
+| 403    | No `owner` role, or `actor.id` is not the `sub` of the token                     | Problem JSON                                  |
+| 404    | The task is not known                                                            | Problem JSON, `code` `not_found`              |
+| 409    | The state cannot take the command, an old `planVersion`, or 3 concurrent appends | Problem JSON, `code` `conflict`, the reason   |
+| 413    | The body is too large                                                            | Problem JSON                                  |
+| 503    | MongoDB does not answer, or Keycloak cannot be read                              | Problem JSON, `code` `unavailable`            |
 
 `version` is the version of the task stream after the append.
 
@@ -668,9 +679,9 @@ Commands for agents: `CLAUDE.md`.
   A `commandId` that was used for another task gives 409, or the first
   answer with the other `taskId` (api-gateway then gives 502). Use a new
   key for each command.
-- An owner command and a consumer event that append to the same task at
-  the same time give 409 `conflict` for the command (a `ConcurrencyError`).
-  The route does not try again. Send the command again with a new key.
+- The same `commandId` with another body gives the first answer and
+  appends nothing (the kit pattern). The route does not compare the
+  bodies.
 - On the cluster the owner routes need `OIDC_JWKS_URL` (the Keycloak
   service) and a NetworkPolicy egress from orchestration to Keycloak on
   port 8080, the same as budget.

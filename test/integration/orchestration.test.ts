@@ -16,6 +16,7 @@ import {
   waitFor,
   type Started,
 } from "@famashines/ai-systems-kit/testing";
+import { exportJWK, generateKeyPair, SignJWT } from "jose";
 import { envSchema, start } from "../../src/main.ts";
 import { natsConfig, password, streams } from "../nats.ts";
 
@@ -37,16 +38,30 @@ const writerPrompt = {
   variables: [],
 };
 let agentAnswer: [number, unknown] = [200, writerAgent];
+const issuer = "https://auth.example.test/realms/ai-systems";
+const keys = await generateKeyPair("RS256", { extractable: true });
+const jwk = { ...(await exportJWK(keys.publicKey)), kid: "k1", alg: "RS256", use: "sig" };
+const ownerToken = () =>
+  new SignJWT({ typ: "Bearer", azp: "ai-systems-app", realm_access: { roles: ["owner"] } })
+    .setProtectedHeader({ alg: "RS256", kid: "k1" })
+    .setIssuer(issuer)
+    .setAudience("ai-systems-app")
+    .setSubject("owner-1")
+    .setIssuedAt()
+    .setExpirationTime("5m")
+    .sign(keys.privateKey);
 const fakes = await (async () => {
   const server = createServer((request, response) => {
     const [status, body] =
-      request.url === "/internal/agents/by-name/writer/active-version"
-        ? agentAnswer
-        : request.url === `/internal/agents/${writerAgent.agentId}/active-version`
-          ? [200, writerAgent]
-          : request.url === `/internal/prompts/${promptId}/versions/1`
-            ? [200, writerPrompt]
-            : [404, {}];
+      request.url === "/certs"
+        ? [200, { keys: [jwk] }]
+        : request.url === "/internal/agents/by-name/writer/active-version"
+          ? agentAnswer
+          : request.url === `/internal/agents/${writerAgent.agentId}/active-version`
+            ? [200, writerAgent]
+            : request.url === `/internal/prompts/${promptId}/versions/1`
+              ? [200, writerPrompt]
+              : [404, {}];
     response.writeHead(status, { "content-type": "application/json" });
     response.end(JSON.stringify(body));
   });
@@ -74,6 +89,8 @@ const startService = async (): Promise<void> => {
     NATS_PASSWORD: password("orchestration"),
     AGENT_MANAGER_URL: fakes.url,
     PROMPT_STUDIO_URL: fakes.url,
+    OIDC_ISSUER: issuer,
+    OIDC_JWKS_URL: `${fakes.url}/certs`,
     LOG_LEVEL: "silent",
   });
   running = await start({ ...config, PORT: 0 }, { drainDelayMs: 0 });
@@ -115,10 +132,10 @@ after(async () => {
 
 const events = () => mongo.db.collection<{ _id: string; publishedAt: Date | null }>("events");
 
-const submit = (commandId: string, text = "Write a poem") =>
+const submit = async (commandId: string, text = "Write a poem") =>
   fetch(`${base}/internal/commands/submit-task`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", authorization: `Bearer ${await ownerToken()}` },
     body: JSON.stringify({
       commandId,
       type: "orchestration.SubmitTask",

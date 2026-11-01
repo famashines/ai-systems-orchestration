@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import type { JwtVerifier } from "@famashines/ai-systems-kit/auth";
+import { ConcurrencyError } from "@famashines/ai-systems-kit/event-store";
 import { createService, ForbiddenError, UnauthorizedError } from "@famashines/ai-systems-kit/http";
 import { createLogger } from "@famashines/ai-systems-kit/observability";
 import { createMemoryEventStore, fakeClock, fakeIds } from "@famashines/ai-systems-kit/testing";
@@ -19,10 +20,20 @@ const tokens: Record<string, JwtVerifier> = {
 const verify: JwtVerifier = (token) =>
   (tokens[token] ?? (() => Promise.reject(new UnauthorizedError())))(token);
 const agentId = "00000000-0000-4000-8000-00000000a005";
+let failingAppends = 0;
 const app = createService({
   logger,
   routes: routes({
-    store,
+    store: {
+      ...store,
+      append: (input) => {
+        if (failingAppends > 0) {
+          failingAppends -= 1;
+          return Promise.reject(new ConcurrencyError());
+        }
+        return store.append(input);
+      },
+    },
     newId: () => nextTaskId(),
     now: clock.now,
     logger,
@@ -77,10 +88,13 @@ const envelope = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-const submit = (body: unknown) =>
+const submit = (body: unknown, token: string | null = "owner") =>
   fetch(`${base}/internal/commands/submit-task`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      ...(token === null ? {} : { authorization: `Bearer ${token}` }),
+    },
     body: JSON.stringify(body),
   });
 
@@ -375,4 +389,30 @@ test("an unknown task gives 404; an old plan version or a wrong state gives 409"
   assert.equal(response.status, 409);
   assert.equal(((await response.json()) as { detail: string }).detail, "The run is not running.");
   assert.equal((await store.readStream(`task-${taskId}`)).length, 2);
+});
+
+test("SubmitTask checks the owner token before the body, and the actor must be the subject", async () => {
+  const before = (await store.readAll({ limit: 1000 })).length;
+  assert.deepEqual(await problemOf(await submit({}, null)), { status: 401, code: "unauthorized" });
+  assert.deepEqual(await problemOf(await submit({}, "guest")), { status: 403, code: "forbidden" });
+  assert.deepEqual(
+    await problemOf(await submit(envelope({ actor: { kind: "owner", id: "someone-else" } }))),
+    { status: 403, code: "forbidden" },
+  );
+  assert.equal((await store.readAll({ limit: 1000 })).length, before);
+});
+
+test("an owner command reads and decides again after a concurrent append, at most 3 times", async () => {
+  const taskId = await seed();
+  failingAppends = 2;
+  const approved = await command("approve-plan", approve(taskId));
+  assert.equal(approved.status, 201);
+  failingAppends = 3;
+  const pause = { ...approve(taskId), type: "orchestration.PauseRun", payload: { taskId } };
+  assert.deepEqual(await problemOf(await command("pause-run", pause)), {
+    status: 409,
+    code: "conflict",
+  });
+  assert.equal(failingAppends, 0);
+  assert.equal((await command("pause-run", pause)).status, 201);
 });
