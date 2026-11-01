@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The task allowance of a task with a model is 10,000,000 micro-USD
+  (10 USD), not 1,000,000 (ADR 0031). One call at 32000 output tokens
+  can cost up to 1.60 USD, and a task makes at least 3 calls. `maxTokens`
+  32000, `maxDurationMs` 300000 and the tasks with no model do not
+  change.
 - Contracts v0.5.0: the owner chooses the model and the reasoning effort
   of a chat task. `OwnerMessagePosted` (`new_task`) gives its `model` and
   `effort` to `TaskSubmitted`. A task with a model sends `[task model]`
@@ -10,7 +15,7 @@
   that model and has no effort. Orchestration drops a model that the
   planner names, and `checkPlan` takes a task model that no agent has.
   Each call of a task with a model has `maxTokens` 32000 and
-  `maxDurationMs` 300000. The task allowance is 1,000,000 micro-USD for
+  `maxDurationMs` 300000. The task allowance is 10,000,000 micro-USD for
   the call caps, the runaway rules, the plan budget check, `maxSubtasks`
   and the rework rule. `maxCalls` and the estimates stay the agent
   values. A task with no model does not change. Deploy after ai-proxy on

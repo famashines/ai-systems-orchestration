@@ -114,10 +114,10 @@ and check.
   has is valid.
 - Each call of the task has `maxTokens` 32000 and `maxDurationMs`
   300000 (300 s), also a subtask with a model of the owner.
-- The task allowance is 1,000,000 micro-USD (1 USD), in place of the
-  `limits.maxCostMicroUsd` of the agent. Orchestration uses it for the
-  `maxCostMicroUsd` of each call, the runaway rules, the plan budget
-  check, `maxSubtasks` and the rework rule.
+- The task allowance is 10,000,000 micro-USD (10 USD, ADR 0031), in
+  place of the `limits.maxCostMicroUsd` of the agent. Orchestration uses
+  it for the `maxCostMicroUsd` of each call, the runaway rules, the plan
+  budget check, `maxSubtasks` and the rework rule.
 - `maxCalls` stays the agent value.
 - The estimates of a subtask do not change: they are the agent rule
   (below), also for a task with a model.
@@ -401,8 +401,8 @@ Runaway rules (ADR 0015, base) before each try give `SubtaskBlocked`
 
 - the task made `MAX_CALLS_PER_TASK` calls (default 50);
 - the calls of the task with that agent reach `limits.maxCalls`;
-- the task cost reaches `limits.maxCostMicroUsd` (1,000,000 for a task
-  with a model).
+- the task cost reaches `limits.maxCostMicroUsd` (10,000,000 for a
+  task with a model).
 
 The rule "the same request hash 3 times in one subtask" is M4.
 
