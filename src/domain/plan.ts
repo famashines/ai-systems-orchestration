@@ -30,7 +30,7 @@ import {
   type TaskState,
 } from "./state.ts";
 
-export const maxPlanTries = 2;
+const maxPlanTries = 2;
 export const orchestratorName = "orchestrator";
 
 export const estimate = (limits: AgentLimits): number =>
@@ -173,7 +173,7 @@ export function agentNames(text: string, allowed: readonly string[]): string[] {
   return [...new Set(names)].filter((name) => allowed.includes(name));
 }
 
-export function readPlan(state: TaskState, text: string, env: RunEnv): PlanResult {
+function readPlan(state: TaskState, text: string, env: RunEnv): PlanResult {
   const output = readJson(text);
   if (typeof output !== "object" || output === null || Array.isArray(output)) {
     return { refused: "The answer is not one JSON object." };

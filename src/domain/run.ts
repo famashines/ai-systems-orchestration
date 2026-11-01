@@ -242,15 +242,15 @@ export function subtaskMessages(
     ...ownerBlocks(later, newId),
     ...outputs.map(outputBlock),
     ...(rework === undefined ? [] : [outputBlock(rework.output)]),
-    ...(feedback === undefined || feedback.pass
+    ...(rework === undefined || feedback === undefined || feedback.pass
       ? []
-      : [cut("quality_check", rework?.verdict.callId ?? newId(), feedback.feedback)]),
+      : [cut("quality_check", rework.verdict.callId, feedback.feedback)]),
   ];
 }
 
 const laterLine = "Later messages of the owner about the request are in more owner_message blocks.";
 
-export const cut = (name: string, id: string, text: string): CallMessage => ({
+const cut = (name: string, id: string, text: string): CallMessage => ({
   role: "user",
   content: block(name, id, text.slice(0, 100_000 - block(name, id, "").length)),
 });
@@ -278,18 +278,18 @@ const Verdict = z.union([
   z.object({ pass: z.literal(false), step: z.int().min(1).max(20), feedback: SubtaskInstructions }),
 ]);
 
-export function verdictOf(text: string): z.infer<typeof Verdict> | undefined {
+function verdictOf(text: string): z.infer<typeof Verdict> | undefined {
   const parsed = Verdict.safeParse(readJson(text));
   return parsed.success ? parsed.data : undefined;
 }
 
-export type Prepared =
+type Prepared =
   | { call: CallRequestedEventPayloadV1 }
   | { fail: { code: ErrorCode; reason: string; retryable: boolean } }
   | { stop: string }
   | { wait: true };
 
-export interface CallSpec {
+interface CallSpec {
   kind: CallKind;
   subtaskId?: string;
   models?: string[] | undefined;

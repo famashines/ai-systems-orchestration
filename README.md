@@ -125,17 +125,17 @@ model or the owner.
 
 The answer is read as JSON (a JSON code fence is permitted). Then:
 
-| Answer                                                              | Result                                                                                                                         |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `{"questions": [...]}`, 1 to 5 `ClarifyingQuestion`s, and permitted | `ClarificationRequested`. The owner `answer` gives `ClarificationAnswered` and a new plan call                                 |
-| `{"subtasks": [...]}` that passes all checks, mode `approval`       | `PlanProposed` `awaitsApproval` true. The run starts after `ApprovePlan` (M3-04)                                               |
-| the same, mode `auto`                                               | `PlanProposed` `awaitsApproval` false, `PlanApproved` (actor `system`), and the `StartRun` events (`runId` new), in one append |
-| a refused answer, first try of the round                            | one more plan call with the reason                                                                                             |
-| a refused answer, second try                                        | `RunFailed` `validation_failed`, `The orchestrator gave no valid plan in 2 tries. The last reason: <reason>`                   |
-| last `CallFailed` `budget_refused`                                  | `RunFailed` `budget_refused`, `The budget refused the plan call: <reason>`                                                     |
-| last `CallFailed` `rate_limit`, `timeout`, `provider`               | one more plan call; on the second try `RunFailed` (`rate_limited`, `unavailable`)                                              |
-| last `CallFailed` `invalid`, `cancelled`                            | `RunFailed` `internal`                                                                                                         |
-| a plan agent read that fails with another code than `not_found`     | `RunFailed` with the code of the read                                                                                          |
+| Answer                                                                  | Result                                                                                                                         |
+| ----------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `{"questions": [...]}`, 1 to 5 `ClarifyingQuestion`s, and permitted     | `ClarificationRequested`. The owner `answer` gives `ClarificationAnswered` and a new plan call                                 |
+| `{"subtasks": [...]}` that passes all checks, mode `approval`           | `PlanProposed` `awaitsApproval` true. The run starts after `ApprovePlan` (M3-04)                                               |
+| the same, mode `auto`                                                   | `PlanProposed` `awaitsApproval` false, `PlanApproved` (actor `system`), and the `StartRun` events (`runId` new), in one append |
+| a refused answer, first try of the round                                | one more plan call with the reason                                                                                             |
+| a refused answer, second try                                            | `RunFailed` `validation_failed`, `The orchestrator gave no valid plan in 2 tries. The last reason: <reason>`                   |
+| last `CallFailed` `budget_refused`                                      | `RunFailed` `budget_refused`, `The budget refused the plan call: <reason>`                                                     |
+| last `CallFailed` `rate_limit`, `timeout`, `provider`                   | one more plan call; on the second try `RunFailed` (`rate_limited`, `unavailable`)                                              |
+| last `CallFailed` `invalid`, `cancelled`                                | `RunFailed` `internal`                                                                                                         |
+| a read of a plan agent or the orchestrator that fails (not `not_found`) | `RunFailed` with the code of the read                                                                                          |
 
 A round is the first plan call, or the plan call after the answer. A
 task has at most one round of questions: questions are permitted only
