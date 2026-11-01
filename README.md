@@ -257,7 +257,8 @@ totals, the values of that attempt) and the text. Then:
 | `CallCompleted` with empty or white-space text   | `SubtaskFailed` `empty_output`, a retry                                 |
 | `CallFailed` `rate_limit`, `timeout`, `provider` | `SubtaskFailed` (`rate_limited`, `unavailable`), a retry                |
 | `CallFailed` `invalid` or `cancelled`            | `SubtaskFailed` `internal`, no retry                                    |
-| `CallFailed` `budget_refused`                    | `SubtaskBlocked` `budget_refused`, then `RunBlocked` `budget_refused`   |
+| `CallFailed` `budget_refused`, a split cap       | `SubtaskQueued`: the subtask starts again alone, with the full rest     |
+| `CallFailed` `budget_refused`, the full rest     | `SubtaskBlocked` `budget_refused`, then `RunBlocked` `budget_refused`   |
 | a call of a subtask that does not run it now     | only `CallSettled` (for example the cancelled calls of a cancelled run) |
 | a call that has its `CallSettled`                | nothing                                                                 |
 
@@ -281,6 +282,16 @@ So the settled cost and the caps of all calls in flight are never above
 the allowance together. When the cap is 0 and a call is in flight, the
 subtask stays `queued` until a call settles. When no call is in flight,
 the cap is the full rest.
+
+A cap is a split share when other calls were in flight at its start, or
+when it was split over more than one slot. When ai-proxy refuses a split
+share with `budget_refused` (for example, the worst case of one attempt
+is above the share), the run does not block: `SubtaskQueued` follows,
+and that subtask starts again only when no call is in flight, with the
+full rest (one slot). It keeps this rule for the rest of the run, also
+after `ResumeRun` or `RetrySubtask`. Only a refused call with the full
+rest blocks the run. So split shares that are too small run the
+subtasks one at a time, and the run can complete.
 
 Runaway rules (ADR 0015, base) before each try give `SubtaskBlocked`
 `runaway_stopped` and `RunBlocked` `runaway_stopped`:

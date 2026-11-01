@@ -54,6 +54,14 @@ export interface SubtaskState {
   steers?: number;
   failure?: { code: ErrorCode; reason: string };
   checkpoint?: Checkpoint;
+  solo?: boolean;
+}
+
+export interface StartBasis {
+  inFlight: number;
+  busy: number;
+  toRun: number;
+  solo: boolean;
 }
 
 export interface CallState {
@@ -61,6 +69,7 @@ export interface CallState {
   subtaskId?: string;
   agentId: string;
   maxCostMicroUsd?: number;
+  basis?: StartBasis;
   settled: boolean;
   cancelRequested: boolean;
 }
@@ -185,6 +194,21 @@ function withCall(state: TaskState, callId: string, change: Partial<CallState>):
   return { ...state, calls: { ...state.calls, [callId]: { ...call, ...change } } };
 }
 
+const ended = ["done", "cancelled", "skipped", "running"];
+
+function startBasis(state: TaskState, subtaskId: string): StartBasis {
+  const others = (state.plan?.subtasks ?? []).filter((item) => item.subtaskId !== subtaskId);
+  const statusOf = (id: string) => state.subtasks[id]?.status ?? "waiting";
+  return {
+    inFlight: Object.values(state.calls)
+      .filter((call) => call.kind !== undefined && !call.settled)
+      .reduce((sum, call) => sum + (call.maxCostMicroUsd ?? 0), 0),
+    busy: others.filter(({ subtaskId: id }) => statusOf(id) === "running").length,
+    toRun: 1 + others.filter(({ subtaskId: id }) => !ended.includes(statusOf(id))).length,
+    solo: state.subtasks[subtaskId]?.solo === true,
+  };
+}
+
 export function evolve(state: TaskState, event: HistoryEvent): TaskState {
   switch (event.type) {
     case "orchestration.TaskSubmitted": {
@@ -237,12 +261,17 @@ export function evolve(state: TaskState, event: HistoryEvent): TaskState {
         status: "waiting",
       }));
     case "orchestration.SubtaskQueued":
-      return withSubtask(state, event.payload.subtaskId, ({ checkpoint, steers }) => ({
-        status: "queued",
-        tries: 0,
-        ...(checkpoint === undefined ? {} : { checkpoint }),
-        ...(steers === undefined ? {} : { steers }),
-      }));
+      return withSubtask(
+        state,
+        event.payload.subtaskId,
+        ({ status, checkpoint, steers, solo }) => ({
+          status: "queued",
+          tries: 0,
+          ...(status === "running" || solo === true ? { solo: true } : {}),
+          ...(checkpoint === undefined ? {} : { checkpoint }),
+          ...(steers === undefined ? {} : { steers }),
+        }),
+      );
     case "orchestration.CheckpointOpened": {
       const { checkpointId, deadline } = event.payload;
       return withSubtask(state, event.payload.subtaskId, (subtask) => ({
@@ -347,6 +376,9 @@ export function evolve(state: TaskState, event: HistoryEvent): TaskState {
         [callId]: {
           agentId,
           ...(maxCostMicroUsd === undefined ? {} : { maxCostMicroUsd }),
+          ...(kind === "subtask" && subtaskId !== undefined
+            ? { basis: startBasis(state, subtaskId) }
+            : {}),
           settled: false,
           cancelRequested: false,
           ...(kind === undefined ? {} : { kind }),

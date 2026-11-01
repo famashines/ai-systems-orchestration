@@ -17,6 +17,7 @@ import {
   runningCalls,
   TaskConflictError,
   type AgentLoad,
+  type CallState,
   type SubtaskState,
   type TaskEvent,
   type TaskState,
@@ -146,6 +147,7 @@ export function failTry(
 
 const isStartable = (state: TaskState, subtask: PlanSubtask, now: Date): boolean => {
   const current = subtaskOf(state, subtask.subtaskId);
+  if (current?.solo === true && (inFlightCaps(state) > 0 || busyCount(state) > 0)) return false;
   if (current?.status === "queued") {
     return !subtask.needsApproval || current.checkpoint?.status === "approved";
   }
@@ -270,7 +272,10 @@ function start(state: TaskState, subtask: PlanSubtask, load: AgentLoad, env: Run
   }
   const inFlight = inFlightCaps(state);
   const rest = next.maxCostMicroUsd - inFlight;
-  const slots = Math.max(1, Math.min(env.settings.maxParallel - busyCount(state), toRun(state)));
+  const slots =
+    current?.solo === true
+      ? 1
+      : Math.max(1, Math.min(env.settings.maxParallel - busyCount(state), toRun(state)));
   const share = Math.max(0, Math.floor(rest / slots));
   if (share === 0 && inFlight > 0) return [];
   const callId = env.newId();
@@ -398,6 +403,11 @@ export function schedule(state: TaskState, env: RunEnv): TaskEvent[] {
   }
 }
 
+const wasShare = ({ basis }: CallState, settings: RunSettings): boolean =>
+  basis !== undefined &&
+  (basis.inFlight > 0 ||
+    (!basis.solo && Math.min(settings.maxParallel - basis.busy, basis.toRun) > 1));
+
 type FinalCall = { completed: CallCompletedEventPayloadV1 } | { failed: CallFailedEventPayloadV1 };
 
 const usageOf = (call: CallCompletedEventPayloadV1 | CallFailedEventPayloadV1) => ({
@@ -445,6 +455,9 @@ export function settleCall(
     return [settled, event("orchestration.SubtaskCompleted", { ...ids, callId, text, ...usage })];
   }
   const { errorClass, reason: why } = final.failed;
+  if (errorClass === "budget_refused" && wasShare(call, env.settings)) {
+    return [settled, event("orchestration.SubtaskQueued", ids)];
+  }
   if (errorClass === "budget_refused") {
     return [
       settled,

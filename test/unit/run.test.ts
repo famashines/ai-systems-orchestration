@@ -717,11 +717,20 @@ test("a CallFailed with a next model gives nothing; a repeated final event gives
   assert.deepEqual(handle(once.history, done(callA)).events, []);
 });
 
-test("a budget refusal blocks the subtask and the run; ResumeRun queues it again with try 1", () => {
+test("a refused split cap queues the subtask again; a refused full rest blocks; ResumeRun starts it with the full rest", () => {
   const run = started().history;
+  const shared = handle(run, failed(callOf(run, A), "budget_refused", { costMicroUsd: 0 }));
+  assert.deepEqual(types(shared.events), [
+    "CallSettled",
+    "SubtaskQueued",
+    "SubtaskStarted",
+    "CallRequested",
+  ]);
+  const solo = find(shared.events, "orchestration.CallRequested");
+  assert.equal(solo.maxCostMicroUsd, 50_000);
   const refused = handle(
-    run,
-    failed(callOf(run, A), "budget_refused", { reason: "Monthly cap reached" }),
+    shared.history,
+    failed(solo.callId, "budget_refused", { reason: "Monthly cap reached", costMicroUsd: 0 }),
   );
   assert.deepEqual(types(refused.events), ["CallSettled", "SubtaskBlocked", "RunBlocked"]);
   assert.deepEqual(find(refused.events, "orchestration.RunBlocked"), {
@@ -737,6 +746,47 @@ test("a budget refusal blocks the subtask and the run; ResumeRun queues it again
     "CallRequested",
   ]);
   assert.equal(find(resumed.events, "orchestration.SubtaskStarted").tryNumber, 1);
+  assert.equal(find(resumed.events, "orchestration.CallRequested").maxCostMicroUsd, 50_000);
+});
+
+test("split caps that ai-proxy refuses run one subtask at a time with the full rest, and the run completes", () => {
+  const wide = [step(A, "A"), step(B, "B"), step(D, "D")];
+  const options = { load: limited({ maxCostMicroUsd: 2000 }) };
+  const run = handle(planned(wide), { type: "StartRun", runId }, options);
+  const caps = (events: TaskEvent[]) =>
+    events.flatMap((item) =>
+      item.type === "orchestration.CallRequested" ? [item.payload.maxCostMicroUsd] : [],
+    );
+  assert.deepEqual(caps(run.events), [666, 667, 667]);
+  let current = run;
+  for (const subtaskId of [A, B, D]) {
+    current = handle(
+      current.history,
+      failed(callOf(run.events, subtaskId), "budget_refused", { costMicroUsd: 0 }),
+      options,
+    );
+    assert.ok(!types(current.events).includes("RunBlocked"));
+  }
+  assert.deepEqual(caps(current.events), [2000]);
+  const costs: number[] = [];
+  for (let round = 0; round < 3; round += 1) {
+    const open = Object.entries(current.state.calls).filter(([, call]) => !call.settled);
+    assert.equal(open.length, 1);
+    const [callId, call] = open[0] ?? ["", { maxCostMicroUsd: 0 }];
+    costs.push(call.maxCostMicroUsd ?? 0);
+    current = handle(current.history, done(callId, "Out.", { costMicroUsd: 900 }), options);
+  }
+  assert.deepEqual(costs, [2000, 1100, 200]);
+  assert.equal(current.state.status, "completed");
+});
+
+test("a refused call with the full rest blocks the run", () => {
+  const options = { load: limited({ maxCostMicroUsd: 2000 }) };
+  const run = handle(planned([step(A, "A")]), { type: "StartRun", runId }, options);
+  assert.equal(find(run.events, "orchestration.CallRequested").maxCostMicroUsd, 2000);
+  const { events } = handle(run.history, failed(callOf(run.events, A), "budget_refused"), options);
+  assert.deepEqual(types(events), ["CallSettled", "SubtaskBlocked", "RunBlocked"]);
+  assert.equal(find(events, "orchestration.RunBlocked").code, "budget_refused");
 });
 
 test("ResumeRun of a run blocked with subtask_failed is a conflict; RetrySubtask queues the subtask and resumes", () => {

@@ -42,6 +42,10 @@
   free slots. A call that is not valid fails with the reason of the
   schema. The timer window moves back after a backward clock step. A
   decide matrix test of each input in each state.
+- A `budget_refused` for a split cap gives `SubtaskQueued`, not a block:
+  that subtask starts again alone with the full rest. Only a refused call
+  with the full rest gives `SubtaskBlocked` and `RunBlocked`
+  `budget_refused`.
 - Deploy with the strategy `Recreate`, after conversation-hub,
   projections and ai-proxy are on v0.4.1 (contracts CHANGELOG 0.4.1).
 
