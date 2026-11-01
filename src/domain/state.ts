@@ -91,6 +91,18 @@ export interface TaskState {
   calls: Readonly<Record<string, CallState>>;
   costMicroUsd: number;
   steers: readonly { messageId: string; text: string }[];
+  orchestratorId?: string;
+  orchestratorCall?: { callId: string; kind: Exclude<CallKind, "subtask"> };
+  planTries: number;
+  questions?: readonly string[];
+  answers: readonly { messageId: string; text: string }[];
+  answer?: { callId: string; text: string; costMicroUsd: number };
+  verdict?: { callId: string; text: string };
+  rework?: {
+    subtaskId: string;
+    output: { callId: string; text: string };
+    verdict: { callId: string; text: string };
+  };
 }
 
 export class TaskExistsError extends Error {
@@ -114,6 +126,8 @@ export const initialState: TaskState = {
   calls: {},
   costMicroUsd: 0,
   steers: [],
+  planTries: 0,
+  answers: [],
 };
 
 export const taskStreamId = (taskId: string): string => `task-${taskId}`;
@@ -224,9 +238,16 @@ export function evolve(state: TaskState, event: HistoryEvent): TaskState {
       };
     }
     case "orchestration.ClarificationRequested":
-      return { ...state, status: "clarifying" };
-    case "orchestration.ClarificationAnswered":
-      return { ...state, status: "planning" };
+      return { ...state, status: "clarifying", questions: event.payload.questions };
+    case "orchestration.ClarificationAnswered": {
+      const { messageId, text } = event.payload;
+      return {
+        ...state,
+        status: "planning",
+        planTries: 0,
+        answers: [...state.answers, { messageId, text }],
+      };
+    }
     case "orchestration.PlanProposed": {
       const { planVersion, subtasks, awaitsApproval } = event.payload;
       return {
@@ -260,18 +281,23 @@ export function evolve(state: TaskState, event: HistoryEvent): TaskState {
         ...subtask,
         status: "waiting",
       }));
-    case "orchestration.SubtaskQueued":
-      return withSubtask(
-        state,
-        event.payload.subtaskId,
-        ({ status, checkpoint, steers, solo }) => ({
-          status: "queued",
-          tries: 0,
-          ...(status === "running" || solo === true ? { solo: true } : {}),
-          ...(checkpoint === undefined ? {} : { checkpoint }),
-          ...(steers === undefined ? {} : { steers }),
-        }),
-      );
+    case "orchestration.SubtaskQueued": {
+      const { subtaskId } = event.payload;
+      const before = state.subtasks[subtaskId];
+      const next: TaskState = { ...state };
+      if (before?.status === "done" && before.output !== undefined && state.verdict) {
+        next.rework = { subtaskId, output: before.output, verdict: state.verdict };
+      }
+      delete next.answer;
+      delete next.verdict;
+      return withSubtask(next, subtaskId, ({ status, checkpoint, steers, solo }) => ({
+        status: "queued",
+        tries: 0,
+        ...(status === "running" || solo === true ? { solo: true } : {}),
+        ...(checkpoint === undefined ? {} : { checkpoint }),
+        ...(steers === undefined ? {} : { steers }),
+      }));
+    }
     case "orchestration.CheckpointOpened": {
       const { checkpointId, deadline } = event.payload;
       return withSubtask(state, event.payload.subtaskId, (subtask) => ({
@@ -385,7 +411,15 @@ export function evolve(state: TaskState, event: HistoryEvent): TaskState {
           ...(subtaskId === undefined ? {} : { subtaskId }),
         },
       };
-      if (kind !== undefined) return { ...state, calls };
+      if (kind === "subtask") return { ...state, calls };
+      if (kind !== undefined) {
+        return {
+          ...state,
+          calls,
+          orchestratorCall: { callId, kind },
+          ...(kind === "plan" ? { orchestratorId: agentId, planTries: state.planTries + 1 } : {}),
+        };
+      }
       return {
         ...state,
         calls,
@@ -393,11 +427,18 @@ export function evolve(state: TaskState, event: HistoryEvent): TaskState {
         ...(event.occurredAt === undefined ? {} : { calledAt: event.occurredAt }),
       };
     }
-    case "orchestration.CallSettled":
-      return {
-        ...withCall(state, event.payload.callId, { settled: true }),
-        costMicroUsd: state.costMicroUsd + event.payload.costMicroUsd,
+    case "orchestration.CallSettled": {
+      const { callId, kind, text, costMicroUsd } = event.payload;
+      const settled = {
+        ...withCall(state, callId, { settled: true }),
+        costMicroUsd: state.costMicroUsd + costMicroUsd,
       };
+      if (kind === "aggregate" && text !== undefined && text.trim() !== "") {
+        return { ...settled, answer: { callId, text, costMicroUsd } };
+      }
+      if (kind === "check") return { ...settled, verdict: { callId, text: text ?? "" } };
+      return settled;
+    }
     case "orchestration.CallCancelRequested":
       return withCall(state, event.payload.callId, { cancelRequested: true });
     case "orchestration.SteeringMessageAdded": {

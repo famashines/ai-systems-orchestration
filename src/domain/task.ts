@@ -1,35 +1,33 @@
 import type {
   CallCompletedEventPayloadV1,
   CallFailedEventPayloadV1,
-  CallMessage,
-  ErrorCode,
   TaskMode,
 } from "@famashines/ai-systems-contracts";
+import { agentNames, isPlanCall, planCall, settlePlan } from "./plan.ts";
 import {
-  block,
-  callDurationMs,
   decideRun,
   event,
   notStarted,
   settleCall,
   type RunCommand,
   type RunEnv,
+  type RunSettings,
 } from "./run.ts";
 import {
   failedCodes,
+  fold,
   isRunActive,
-  nextCall,
   reason,
   runningCalls,
   TaskExistsError,
-  type LoadFailure,
+  type AgentLoad,
   type TaskEvent,
   type TaskState,
-  type Writer,
 } from "./state.ts";
 
 export * from "./state.ts";
 export * from "./run.ts";
+export * from "./plan.ts";
 
 export const staleAfterMs = 15 * 60_000;
 export const staleReason =
@@ -51,11 +49,9 @@ export interface SubmitTask {
 export interface StartChatTask {
   type: "StartChatTask";
   taskId: string;
-  runId: string;
-  callId: string;
-  blockId: string;
+  mode: TaskMode;
   message: ChatMessage;
-  writer: Writer | LoadFailure;
+  orchestrator: AgentLoad;
 }
 
 export interface TakeMessage {
@@ -78,64 +74,19 @@ export interface FailCall {
 export type TaskCommand =
   SubmitTask | StartChatTask | TakeMessage | CompleteCall | FailCall | RunCommand;
 
-export const dataBlock = (text: string, blockId: string): string =>
-  [
-    "Answer the owner's chat message. It is in the data block below.",
-    block("owner_message", blockId, text),
-  ].join("\n");
-
-function startChatTask(command: StartChatTask): TaskEvent[] {
-  const { taskId, runId, callId, blockId, message, writer } = command;
-  const events: TaskEvent[] = [
-    event("orchestration.TaskSubmitted", {
-      taskId,
-      text: message.text,
-      mode: "auto",
-      conversationId: message.conversationId,
-      messageId: message.messageId,
-    }),
-    event("orchestration.RunStarted", { taskId, runId }),
-  ];
-  const failed = (code: ErrorCode, text: string): TaskEvent[] => [
-    ...events,
-    event("orchestration.RunFailed", { taskId, runId, code, reason: reason(text) }),
-  ];
-  if (!("agent" in writer)) return failed(writer.code, writer.reason);
-  const { agent, prompt } = writer;
-  if (!agent.enabled) return failed("unavailable", "The writer agent is off.");
-  if (prompt.variables.length > 0) {
-    return failed("internal", "The writer prompt has variables. Orchestration cannot fill them.");
-  }
-  const next = nextCall(agent.limits, { calls: 0, costMicroUsd: 0 });
-  if ("stop" in next) {
-    return [
-      ...events,
-      event("orchestration.RunBlocked", {
-        taskId,
-        runId,
-        code: "runaway_stopped",
-        reason: reason(next.stop),
-      }),
-    ];
-  }
-  const messages: CallMessage[] = [
-    { role: "system", content: prompt.text },
-    { role: "user", content: dataBlock(message.text, blockId) },
-  ];
-  return [
-    ...events,
-    event("orchestration.CallRequested", {
-      taskId,
-      callId,
-      agentId: agent.agentId,
-      agentVersion: agent.version,
-      messages,
-      models: agent.models,
-      maxTokens: agent.limits.maxTokens,
-      maxDurationMs: callDurationMs,
-      maxCostMicroUsd: next.maxCostMicroUsd,
-    }),
-  ];
+function startChatTask(
+  state: TaskState,
+  { taskId, mode, message, orchestrator }: StartChatTask,
+  env: RunEnv,
+): TaskEvent[] {
+  const submitted = event("orchestration.TaskSubmitted", {
+    taskId,
+    text: message.text,
+    mode,
+    conversationId: message.conversationId,
+    messageId: message.messageId,
+  });
+  return [submitted, ...planCall(fold(state, [submitted]), orchestrator, env)];
 }
 
 function refusal(state: TaskState, intent: "steer" | "answer"): string {
@@ -164,6 +115,12 @@ function refusal(state: TaskState, intent: "steer" | "answer"): string {
 
 function takeMessage(state: TaskState, command: TakeMessage, env: RunEnv): TaskEvent[] {
   const { taskId, message, intent } = command;
+  if (intent === "answer" && state.status === "clarifying" && state.conversationId !== undefined) {
+    const answered = event("orchestration.ClarificationAnswered", { taskId, ...message });
+    const load =
+      state.orchestratorId === undefined ? undefined : env.agents.get(state.orchestratorId);
+    return [answered, ...planCall(fold(state, [answered]), load, env)];
+  }
   if (intent === "steer" && state.runId !== undefined && isRunActive(state) && notStarted(state)) {
     return [
       event("orchestration.SteeringMessageAdded", { taskId, ...message, runId: state.runId }),
@@ -266,14 +223,54 @@ export function decide(state: TaskState, command: TaskCommand, env: RunEnv): Tas
     }
     case "StartChatTask":
       if (state.status !== "new") throw new TaskExistsError();
-      return startChatTask(command);
+      return startChatTask(state, command, env);
     case "TakeMessage":
       return takeMessage(state, command, env);
     case "CompleteCall":
-      return settleCall(state, { completed: command.call }, env) ?? completeCall(state, command);
+      return settle(state, { completed: command.call }, env) ?? completeCall(state, command);
     case "FailCall":
-      return settleCall(state, { failed: command.call }, env) ?? failCall(state, command);
+      return settle(state, { failed: command.call }, env) ?? failCall(state, command);
     default:
       return decideRun(state, command, env);
+  }
+}
+
+type FinalCall = Parameters<typeof settlePlan>[1];
+
+function settle(state: TaskState, final: FinalCall, env: RunEnv): TaskEvent[] | undefined {
+  const { callId } = "completed" in final ? final.completed : final.failed;
+  const planning = isPlanCall(state, callId);
+  const settled = settleCall(state, final, env);
+  if (!planning || settled === undefined || settled.length === 0) return settled;
+  return [...settled, ...settlePlan(fold(state, settled), final, env)];
+}
+
+export interface Loads {
+  agentIds: string[];
+  names: string[];
+}
+
+export function toLoadBefore(
+  state: TaskState,
+  command: TaskCommand,
+  settings: Pick<RunSettings, "planAgents">,
+): Loads {
+  const orchestrator = state.orchestratorId === undefined ? [] : [state.orchestratorId];
+  switch (command.type) {
+    case "TakeMessage":
+      return command.intent === "answer" && state.status === "clarifying"
+        ? { agentIds: orchestrator, names: [] }
+        : { agentIds: [], names: [] };
+    case "CompleteCall":
+    case "FailCall": {
+      if (!isPlanCall(state, command.call.callId)) return { agentIds: [], names: [] };
+      const names =
+        command.type === "CompleteCall"
+          ? agentNames(command.call.text, settings.planAgents ?? [])
+          : [];
+      return { agentIds: orchestrator, names };
+    }
+    default:
+      return { agentIds: [], names: [] };
   }
 }

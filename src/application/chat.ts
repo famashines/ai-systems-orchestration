@@ -1,14 +1,10 @@
 import type { RegisteredEvent } from "@famashines/ai-systems-contracts";
 import type { HandlerContext } from "@famashines/ai-systems-kit/messaging";
-import { isClosed, type AgentLoad } from "../domain/task.ts";
+import { isClosed, orchestratorName } from "../domain/task.ts";
 import { act, system, type TaskDeps } from "./run.ts";
 
-export interface ChatDeps extends TaskDeps {
-  loadWriter: () => Promise<AgentLoad>;
-}
-
 export async function onOwnerMessage(
-  deps: ChatDeps,
+  deps: TaskDeps,
   event: RegisteredEvent,
   { markProcessed }: HandlerContext,
 ): Promise<void> {
@@ -20,15 +16,18 @@ export async function onOwnerMessage(
     text: payload.text,
   };
   if (payload.intent === "new_task") {
-    const writer = await deps.loadWriter();
+    const orchestrator = await deps.loadAgentByName(orchestratorName);
     const taskId = deps.newId();
-    const runId = deps.newId();
-    const callId = deps.newId();
-    const blockId = deps.newId();
     await act(deps, {
       taskId,
       causationId: event.eventId,
-      command: { type: "StartChatTask", taskId, runId, callId, blockId, message, writer },
+      command: {
+        type: "StartChatTask",
+        taskId,
+        mode: payload.mode ?? "approval",
+        message,
+        orchestrator,
+      },
       actorOf: (created) => (created.type === "orchestration.TaskSubmitted" ? event.actor : system),
       also: markProcessed,
     });

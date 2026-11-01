@@ -5,9 +5,9 @@ import { test } from "node:test";
 import type { RegisteredEvent } from "@famashines/ai-systems-contracts";
 import type { HandlerContext } from "@famashines/ai-systems-kit/messaging";
 import { createMemoryEventStore, fakeIds } from "@famashines/ai-systems-kit/testing";
-import { agentByIdLoader, ReadFailedError, writerLoader } from "../../src/adapters/writer.ts";
-import { onTimer } from "../../src/application/run.ts";
-import { onLlmEvent, onOwnerMessage, type ChatDeps } from "../../src/application/chat.ts";
+import { agentByIdLoader, agentByNameLoader, ReadFailedError } from "../../src/adapters/writer.ts";
+import { onTimer, type TaskDeps } from "../../src/application/run.ts";
+import { onLlmEvent, onOwnerMessage } from "../../src/application/chat.ts";
 import type { Writer } from "../../src/domain/task.ts";
 
 const promptId = "cc74090a-534e-4072-8bfd-e6c5b9f22f41";
@@ -61,13 +61,33 @@ const logger = {
   },
 };
 
-const setup = (loadWriter: ChatDeps["loadWriter"] = () => Promise.resolve(writer)) => {
+const orchestrator: Writer = {
+  agent: {
+    ...writer.agent,
+    agentId: "00000000-0000-4000-8000-00000000a001",
+    name: "orchestrator",
+  },
+  prompt: { ...writer.prompt, name: "orchestrator", text: "You are the orchestrator." },
+};
+
+const byName = (name: string) =>
+  Promise.resolve(
+    name === "orchestrator"
+      ? orchestrator
+      : name === "writer"
+        ? writer
+        : { code: "not_found" as const, reason: "No agent." },
+  );
+const byId = (agentId: string) =>
+  Promise.resolve([orchestrator, writer].find((item) => item.agent.agentId === agentId) ?? writer);
+
+const setup = (loadAgentByName: TaskDeps["loadAgentByName"] = byName) => {
   const store = createMemoryEventStore({ newId: fakeIds(1) });
-  const deps: ChatDeps = {
+  const deps: TaskDeps = {
     store,
     newId: fakeIds(2),
-    loadWriter,
-    loadAgent: () => Promise.resolve(writer),
+    loadAgentByName,
+    loadAgent: byId,
     now: () => new Date(),
     logger,
     settings: {
@@ -75,118 +95,213 @@ const setup = (loadWriter: ChatDeps["loadWriter"] = () => Promise.resolve(writer
       maxCallsPerTask: 50,
       retryDelaysMs: [5000, 30000],
       checkpointTimeoutMs: 60_000,
+      planAgents: ["writer"],
     },
   };
   return { store, deps };
 };
 
-test("a new_task message gives one task stream with the source as cause, and marks it", async () => {
-  const { store, deps } = setup();
-  const message = posted({ intent: "new_task" });
+const typesOf = async (store: TaskDeps["store"], taskId: string) =>
+  (await store.readStream(`task-${taskId}`)).map((item) => item.type.replace("orchestration.", ""));
+
+const lastCall = async (store: TaskDeps["store"], taskId: string) => {
+  const stream = await store.readStream(`task-${taskId}`);
+  const call = stream.findLast((item) => item.type === "orchestration.CallRequested");
+  assert.equal(call?.type, "orchestration.CallRequested");
+  return call;
+};
+
+const llmEvent = (
+  type: "llm.CallCompleted" | "llm.CallFailed" | "llm.CallStarted",
+  taskId: string,
+  callId: string,
+  extra: Record<string, unknown>,
+) =>
+  ({
+    eventId: ids(),
+    type,
+    schemaVersion: 1,
+    streamId: `call-${callId}`,
+    version: 1,
+    occurredAt: "2026-11-01T10:00:01.000Z",
+    correlationId: taskId,
+    causationId: callId,
+    actor: { kind: "system", id: "ai-proxy" },
+    payload: { taskId, callId, attempt: 1, model: "google/gemini-2.5-flash-lite", ...extra },
+  }) as RegisteredEvent;
+
+const answer = (taskId: string, callId: string, text: string) =>
+  llmEvent("llm.CallCompleted", taskId, callId, {
+    text,
+    finishReason: "stop",
+    inputTokens: 5,
+    outputTokens: 2,
+    cachedTokens: 0,
+    costMicroUsd: 7,
+    latencyMs: 9,
+    bodyId: ids(),
+  });
+
+const newTask = async (deps: TaskDeps, store: TaskDeps["store"], extra = {}) => {
+  const message = posted({ intent: "new_task", ...extra });
   const { value, marked } = context();
   await onOwnerMessage(deps, message, value);
-  const [event] = await store.readAll({ limit: 10 });
-  assert.equal(event?.type, "orchestration.TaskSubmitted");
-  const stream = await store.readStream(event.streamId);
+  const [first] = await store.readAll({ limit: 1 });
+  assert.equal(first?.type, "orchestration.TaskSubmitted");
+  return { message, marked, taskId: first.payload.taskId };
+};
+
+const reply = async (deps: TaskDeps, store: TaskDeps["store"], taskId: string, text: string) => {
+  const call = await lastCall(store, taskId);
+  await onLlmEvent(deps, answer(taskId, call.payload.callId, text), context().value);
+  return call;
+};
+
+const onePlan = JSON.stringify({
+  subtasks: [{ title: "Poem", instructions: "Write the poem.", agent: "writer" }],
+});
+
+test("a new_task message gives TaskSubmitted and a plan call of the orchestrator, and marks it", async () => {
+  const { store, deps } = setup();
+  const { message, marked, taskId } = await newTask(deps, store);
+  const stream = await store.readStream(`task-${taskId}`);
   assert.deepEqual(
     stream.map((item) => [item.type, item.causationId, item.actor.kind]),
     [
       ["orchestration.TaskSubmitted", message.eventId, "owner"],
-      ["orchestration.RunStarted", message.eventId, "system"],
       ["orchestration.CallRequested", message.eventId, "system"],
     ],
   );
-  assert.equal(event.correlationId, event.payload.taskId);
-  assert.equal(marked.length, 1);
-});
-
-test("a CallCompleted of the task ends the run; a CallStarted gives nothing", async () => {
-  const { store, deps } = setup();
-  await onOwnerMessage(deps, posted({ intent: "new_task" }), context().value);
-  const [, , requested] = await store.readAll({ limit: 10 });
-  assert.equal(requested?.type, "orchestration.CallRequested");
-  const { taskId, callId } = requested.payload;
-  const base = {
-    eventId: ids(),
-    schemaVersion: 1,
-    streamId: `call-${callId}`,
-    occurredAt: "2026-11-01T10:00:01.000Z",
-    correlationId: taskId,
-    causationId: requested.eventId,
-    actor: { kind: "system", id: "ai-proxy" },
-  };
-  const attempt = { taskId, callId, attempt: 1, model: "google/gemini-2.5-flash-lite" };
-  const startedCall = {
-    ...base,
-    version: 1,
-    type: "llm.CallStarted",
-    payload: { ...attempt, agentId: ids(), agentVersion: 1, reservationId: ids() },
-  } as RegisteredEvent;
-  const done = {
-    ...base,
-    eventId: ids(),
-    version: 2,
-    type: "llm.CallCompleted",
-    payload: {
-      ...attempt,
-      text: "A poem.",
-      finishReason: "stop",
-      inputTokens: 5,
-      outputTokens: 2,
-      cachedTokens: 0,
-      costMicroUsd: 7,
-      latencyMs: 9,
-      bodyId: ids(),
-    },
-  } as RegisteredEvent;
-  const { value, marked } = context();
-  await onLlmEvent(deps, startedCall, value);
-  assert.equal(marked.length, 0);
-  await onLlmEvent(deps, done, value);
-  await onLlmEvent(deps, done, value);
-  const stream = await store.readStream(`task-${taskId}`);
-  assert.deepEqual(
-    stream.map((item) => item.type),
-    [
-      "orchestration.TaskSubmitted",
-      "orchestration.RunStarted",
-      "orchestration.CallRequested",
-      "orchestration.RunCompleted",
-    ],
+  const [submitted, call] = stream;
+  assert.equal(
+    submitted?.type === "orchestration.TaskSubmitted" && submitted.payload.mode,
+    "approval",
   );
+  assert.equal(call?.type === "orchestration.CallRequested" && call.payload.kind, "plan");
+  assert.equal(
+    call?.type === "orchestration.CallRequested" && call.payload.agentId,
+    orchestrator.agent.agentId,
+  );
+  assert.equal(submitted?.correlationId, taskId);
   assert.equal(marked.length, 1);
-  const failedCall = {
-    ...done,
-    type: "llm.CallFailed",
-    payload: { ...attempt, errorClass: "provider", reason: "HTTP 500", costMicroUsd: 0 },
-  } as RegisteredEvent;
-  warnings.length = 0;
-  await onLlmEvent(deps, failedCall, value);
-  assert.equal((await store.readStream(`task-${taskId}`)).length, 4);
-  assert.deepEqual(warnings, [
-    {
-      details: { taskId, callId, costMicroUsd: 0, type: "llm.CallFailed" },
-      message: "a late call event for a closed task is dropped",
-    },
-  ]);
 });
 
-test("a steer for a running task gives MessageRefused on the task stream", async () => {
+test("approval mode: a valid plan gives PlanProposed that awaits approval, with CallSettled", async () => {
   const { store, deps } = setup();
-  await onOwnerMessage(deps, posted({ intent: "new_task" }), context().value);
-  const [submitted] = await store.readAll({ limit: 1 });
-  const taskId = submitted?.type === "orchestration.TaskSubmitted" ? submitted.payload.taskId : "";
+  const { taskId } = await newTask(deps, store);
+  await reply(deps, store, taskId, onePlan);
+  assert.deepEqual(await typesOf(store, taskId), [
+    "TaskSubmitted",
+    "CallRequested",
+    "CallSettled",
+    "PlanProposed",
+  ]);
+  const proposed = (await store.readStream(`task-${taskId}`))[3];
+  assert.equal(proposed?.type, "orchestration.PlanProposed");
+  assert.equal(proposed.payload.awaitsApproval, true);
+  assert.equal(proposed.payload.subtasks[0]?.agentId, writer.agent.agentId);
+  assert.equal(proposed.payload.subtasks[0].estimatedCostMicroUsd, 5000);
+});
+
+test("auto mode: the run plans, runs the subtask, aggregates, checks and completes with the answer", async () => {
+  const { store, deps } = setup();
+  const { taskId } = await newTask(deps, store, { mode: "auto" });
+  await reply(deps, store, taskId, onePlan);
+  const subtask = await lastCall(store, taskId);
+  assert.equal(subtask.payload.kind, "subtask");
+  await reply(deps, store, taskId, "The sea is wide.");
+  const aggregate = await lastCall(store, taskId);
+  assert.equal(aggregate.payload.kind, "aggregate");
+  assert.equal(aggregate.payload.agentId, orchestrator.agent.agentId);
+  await reply(deps, store, taskId, "The answer (step 1): The sea is wide.");
+  const check = await lastCall(store, taskId);
+  assert.equal(check.payload.kind, "check");
+  await reply(deps, store, taskId, '{"pass": true}');
+  assert.deepEqual(await typesOf(store, taskId), [
+    "TaskSubmitted",
+    "CallRequested",
+    "CallSettled",
+    "PlanProposed",
+    "PlanApproved",
+    "RunStarted",
+    "SubtaskQueued",
+    "SubtaskStarted",
+    "CallRequested",
+    "CallSettled",
+    "SubtaskCompleted",
+    "CallRequested",
+    "CallSettled",
+    "CallRequested",
+    "CallSettled",
+    "RunCompleted",
+  ]);
+  const end = (await store.readStream(`task-${taskId}`)).at(-1);
+  assert.equal(end?.type, "orchestration.RunCompleted");
+  assert.equal(end.payload.summary, "The answer (step 1): The sea is wide.");
+  assert.equal(end.payload.costMicroUsd, 7);
+});
+
+test("clarify: questions give ClarificationRequested, and the answer gives a new plan call", async () => {
+  const { store, deps } = setup();
+  const { taskId } = await newTask(deps, store);
+  await reply(deps, store, taskId, '{"questions": ["About what?"]}');
+  assert.equal((await typesOf(store, taskId)).at(-1), "ClarificationRequested");
+  await onOwnerMessage(
+    deps,
+    posted({ intent: "answer", taskId, text: "About the sea." }),
+    context().value,
+  );
+  assert.deepEqual((await typesOf(store, taskId)).slice(-2), [
+    "ClarificationAnswered",
+    "CallRequested",
+  ]);
+  const call = await lastCall(store, taskId);
+  assert.equal(call.payload.kind, "plan");
+  const contents = call.payload.messages.map((item) => item.content).join("\n");
+  assert.match(contents, /BEGIN DATA clarifying_questions \S+\nAbout what\?\n/);
+  assert.match(contents, /BEGIN DATA owner_message \S+\nAbout the sea\.\n/);
+  assert.match(contents, /Do not ask questions\./);
+});
+
+test("a steer before the run is refused on the task stream", async () => {
+  const { store, deps } = setup();
+  const { taskId } = await newTask(deps, store);
   await onOwnerMessage(deps, posted({ intent: "steer", taskId }), context().value);
   const stream = await store.readStream(`task-${taskId}`);
   assert.equal(stream.at(-1)?.type, "orchestration.MessageRefused");
   assert.equal(stream.at(-1)?.actor.kind, "system");
 });
 
+test("a late call event for a closed task is dropped with a warn log; a CallStarted gives nothing", async () => {
+  const { store, deps } = setup();
+  const { taskId } = await newTask(deps, store);
+  const call = await lastCall(store, taskId);
+  const { value, marked } = context();
+  await onLlmEvent(deps, llmEvent("llm.CallStarted", taskId, call.payload.callId, {}), value);
+  assert.equal(marked.length, 0);
+  const failedCall = llmEvent("llm.CallFailed", taskId, call.payload.callId, {
+    errorClass: "budget_refused",
+    reason: "No monthly cap is set",
+    costMicroUsd: 0,
+  });
+  await onLlmEvent(deps, failedCall, value);
+  assert.deepEqual((await typesOf(store, taskId)).slice(-2), ["CallSettled", "RunFailed"]);
+  warnings.length = 0;
+  await onLlmEvent(deps, failedCall, value);
+  assert.equal((await store.readStream(`task-${taskId}`)).length, 4);
+  assert.deepEqual(warnings, [
+    {
+      details: { taskId, callId: call.payload.callId, costMicroUsd: 0, type: "llm.CallFailed" },
+      message: "a late call event for a closed task is dropped",
+    },
+  ]);
+});
+
 test("a dependency outage after the retries gives TaskSubmitted and RunFailed unavailable", async (t) => {
-  const server = await serve({ [agentPath]: [503, {}] });
+  const server = await serve({ [orchestratorPath]: [503, {}] });
   t.after(server.close);
   const { store, deps } = setup(
-    writerLoader({
+    agentByNameLoader({
       agentManagerUrl: server.url,
       promptStudioUrl: server.url,
       logger,
@@ -198,12 +313,12 @@ test("a dependency outage after the retries gives TaskSubmitted and RunFailed un
   const events = await store.readAll();
   assert.deepEqual(
     events.map((event) => event.type),
-    ["orchestration.TaskSubmitted", "orchestration.RunStarted", "orchestration.RunFailed"],
+    ["orchestration.TaskSubmitted", "orchestration.RunFailed"],
   );
-  const failed = events[2];
+  const failed = events[1];
   assert.equal(failed?.type, "orchestration.RunFailed");
   assert.equal(failed.payload.code, "unavailable");
-  assert.match(failed.payload.reason, /Try again/);
+  assert.match(failed.payload.reason, /orchestrator agent could not start\. Try again/);
 });
 
 test("other event types give nothing", async () => {
@@ -231,9 +346,10 @@ const serve = async (routes: Record<string, [number, unknown]>) => {
 };
 
 const agentPath = "/internal/agents/by-name/writer/active-version";
+const orchestratorPath = "/internal/agents/by-name/orchestrator/active-version";
 const promptPath = `/internal/prompts/${promptId}/versions/1`;
 
-test("writerLoader reads the active writer version and its prompt version", async (t) => {
+test("agentByNameLoader reads the active version by name and its prompt version", async (t) => {
   const cases: [Record<string, [number, unknown]>, unknown][] = [
     [{ [agentPath]: [200, writer.agent], [promptPath]: [200, writer.prompt] }, writer],
     [{}, { code: "not_found", reason: "The writer agent has no active version." }],
@@ -257,12 +373,16 @@ test("writerLoader reads the active writer version and its prompt version", asyn
   for (const [routes, expected] of cases) {
     const server = await serve(routes);
     t.after(server.close);
-    const load = writerLoader({ agentManagerUrl: server.url, promptStudioUrl: server.url, logger });
-    assert.deepEqual(await load(), expected);
+    const load = agentByNameLoader({
+      agentManagerUrl: server.url,
+      promptStudioUrl: server.url,
+      logger,
+    });
+    assert.deepEqual(await load("writer"), expected);
   }
 });
 
-test("writerLoader tries a 5xx or a network error 3 times, then gives unavailable with the cause logged", async (t) => {
+test("agentByNameLoader tries a 5xx or a network error 3 times, then gives unavailable with the cause logged", async (t) => {
   const server = await serve({ [agentPath]: [200, writer.agent], [promptPath]: [502, {}] });
   t.after(server.close);
   const retryDelaysMs = [1, 1];
@@ -272,24 +392,24 @@ test("writerLoader tries a 5xx or a network error 3 times, then gives unavailabl
       "agent-manager or prompt-studio did not answer, so the writer agent could not start. Try again in a minute.",
   };
   assert.deepEqual(
-    await writerLoader({
+    await agentByNameLoader({
       agentManagerUrl: server.url,
       promptStudioUrl: server.url,
       logger,
       retryDelaysMs,
-    })(),
+    })("writer"),
     unavailable,
   );
   assert.equal(server.requests(), 4);
   warnings.length = 0;
   assert.deepEqual(
-    await writerLoader({
+    await agentByNameLoader({
       agentManagerUrl: "http://127.0.0.1:1",
       promptStudioUrl: server.url,
       logger,
       timeoutMs: 500,
       retryDelaysMs,
-    })(),
+    })("writer"),
     unavailable,
   );
   const [warning] = warnings;
@@ -300,7 +420,7 @@ test("writerLoader tries a 5xx or a network error 3 times, then gives unavailabl
   assert.ok(err.cause instanceof Error);
 });
 
-test("writerLoader gives internal with no retry for a 4xx that is not 404", async (t) => {
+test("agentByNameLoader gives internal with no retry for a 4xx that is not 404", async (t) => {
   const cases: [Record<string, [number, unknown]>, number, unknown][] = [
     [
       { [agentPath]: [403, {}] },
@@ -327,13 +447,13 @@ test("writerLoader gives internal with no retry for a 4xx that is not 404", asyn
     const server = await serve(routes);
     t.after(server.close);
     warnings.length = 0;
-    const load = writerLoader({
+    const load = agentByNameLoader({
       agentManagerUrl: server.url,
       promptStudioUrl: server.url,
       logger,
       retryDelaysMs: [1, 1],
     });
-    assert.deepEqual(await load(), expected);
+    assert.deepEqual(await load("writer"), expected);
     assert.equal(server.requests(), requests);
     const { err, attempts } = warnings[0]?.details as { err: ReadFailedError; attempts: number };
     assert.equal(attempts, 1);
