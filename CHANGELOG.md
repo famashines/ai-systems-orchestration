@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The task allowance of a task with a model is 10,000,000 micro-USD
+  (10 USD), not 1,000,000 (ADR 0031). One call at 32000 output tokens
+  can cost up to 1.60 USD, and a task makes at least 3 calls. `maxTokens`
+  32000, `maxDurationMs` 300000 and the tasks with no model do not
+  change.
 - Contracts v0.5.0: the owner chooses the model and the reasoning effort
   of a chat task. `OwnerMessagePosted` (`new_task`) gives its `model` and
   `effort` to `TaskSubmitted`. A task with a model sends `[task model]`

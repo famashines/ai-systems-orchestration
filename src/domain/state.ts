@@ -172,7 +172,7 @@ export function nextCall(
 export const taskLimits = (state: TaskState, limits: AgentLimits): AgentLimits =>
   state.model === undefined
     ? limits
-    : { maxCalls: limits.maxCalls, maxTokens: 32_000, maxCostMicroUsd: 1_000_000 };
+    : { maxCalls: limits.maxCalls, maxTokens: 32_000, maxCostMicroUsd: 10_000_000 };
 
 export const estimate = (limits: AgentLimits): number =>
   Math.ceil(limits.maxCostMicroUsd / limits.maxCalls);

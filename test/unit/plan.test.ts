@@ -934,7 +934,7 @@ test("a task with a model: each call has only the task model, the effort and the
   });
   assert.equal(first.state.model, taskModel);
   assert.equal(first.state.effort, "high");
-  modelCall(lastCall(first.events), 1_000_000);
+  modelCall(lastCall(first.events), 10_000_000);
   const run = handle(
     first.history,
     completed(lastCall(first.events).callId, plan(sub({ model: "openai/gpt-4.1-nano" }))),
@@ -946,18 +946,18 @@ test("a task with a model: each call has only the task model, the effort and the
   assert.equal(subtask.estimatedDurationMs, 120_000);
   const call = lastCall(run.events);
   assert.equal(call.kind, "subtask");
-  modelCall(call, 999_900);
+  modelCall(call, 9_999_900);
   const aggregated = finish(run.history, [["Out.", 60_000]]);
   assert.equal(lastCall(aggregated.events).kind, "aggregate");
-  modelCall(lastCall(aggregated.events), 939_900);
+  modelCall(lastCall(aggregated.events), 9_939_900);
   const checked = finish(aggregated.history, ["Final."]);
   assert.equal(lastCall(checked.events).kind, "check");
-  modelCall(lastCall(checked.events), 939_800);
+  modelCall(lastCall(checked.events), 9_939_800);
   const verdict = JSON.stringify({ pass: false, step: 1, feedback: "Again." });
   const rework = finish(checked.history, [verdict]);
   assert.equal(types(rework.events)[1], "SubtaskQueued");
   assert.equal(lastCall(rework.events).kind, "subtask");
-  modelCall(lastCall(rework.events), 939_700);
+  modelCall(lastCall(rework.events), 9_939_700);
 });
 
 test("a task with no model uses the agent limits: a cost above its allowance stops the run", () => {
@@ -999,7 +999,7 @@ test("a task with a model: a subtask model of the owner runs with no effort and 
   assert.ok(CallRequestedEventPayloadV1.safeParse(call).success);
   assert.deepEqual(
     [call.models, call.effort, call.maxTokens, call.maxDurationMs, call.maxCostMicroUsd],
-    [[hand], undefined, 32_000, 300_000, 499_950],
+    [[hand], undefined, 32_000, 300_000, 4_999_950],
   );
   const reassigned = handle(run.history, {
     type: "ReassignSubtask",
