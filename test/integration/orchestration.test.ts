@@ -36,17 +36,34 @@ const writerPrompt = {
   text: "You are the writer agent.",
   variables: [],
 };
-let agentAnswer: [number, unknown] = [200, writerAgent];
+const plannerPromptId = "a0d53ff1-1eda-4636-bb2f-880df141bcb9";
+const orchestratorAgent = {
+  ...writerAgent,
+  agentId: "00000000-0000-4000-8000-00000000a001",
+  name: "orchestrator",
+  prompt: { promptId: plannerPromptId, version: 1 },
+};
+const orchestratorPrompt = {
+  ...writerPrompt,
+  promptId: plannerPromptId,
+  name: "orchestrator",
+  text: "You are the orchestrator.",
+};
+let agentAnswer: [number, unknown] = [200, orchestratorAgent];
 const fakes = await (async () => {
+  const routes: Record<string, () => [number, unknown]> = {
+    "/internal/agents/by-name/orchestrator/active-version": () => agentAnswer,
+    "/internal/agents/by-name/writer/active-version": () => [200, writerAgent],
+    [`/internal/agents/${writerAgent.agentId}/active-version`]: () => [200, writerAgent],
+    [`/internal/agents/${orchestratorAgent.agentId}/active-version`]: () => [
+      200,
+      orchestratorAgent,
+    ],
+    [`/internal/prompts/${promptId}/versions/1`]: () => [200, writerPrompt],
+    [`/internal/prompts/${plannerPromptId}/versions/1`]: () => [200, orchestratorPrompt],
+  };
   const server = createServer((request, response) => {
-    const [status, body] =
-      request.url === "/internal/agents/by-name/writer/active-version"
-        ? agentAnswer
-        : request.url === `/internal/agents/${writerAgent.agentId}/active-version`
-          ? [200, writerAgent]
-          : request.url === `/internal/prompts/${promptId}/versions/1`
-            ? [200, writerPrompt]
-            : [404, {}];
+    const [status, body] = routes[request.url ?? ""]?.() ?? [404, {}];
     response.writeHead(status, { "content-type": "application/json" });
     response.end(JSON.stringify(body));
   });
@@ -350,16 +367,32 @@ const completedCall = (text: string) => ({
   bodyId: randomUUID(),
 });
 
-test("a new_task message runs the writer: TaskSubmitted, RunStarted, CallRequested, RunCompleted", async () => {
+const lastCall = async (taskId: string, count: number) => {
+  await waitFor(
+    async () =>
+      (await streamOf(taskId)).filter((event) => event.type === "orchestration.CallRequested")
+        .length >= count,
+  );
+  const call = (await streamOf(taskId)).findLast(
+    (event) => event.type === "orchestration.CallRequested",
+  );
+  assert.ok(call);
+  return call;
+};
+
+const onePlan = JSON.stringify({
+  subtasks: [{ title: "Poem", instructions: "Write the poem.", agent: "writer" }],
+});
+
+test("an auto new_task is planned, runs its subtask, aggregates, checks and completes", async () => {
   const messageId = randomUUID();
-  const sourceId = await post({ messageId, intent: "new_task" });
+  const sourceId = await post({ messageId, intent: "new_task", mode: "auto" });
   const taskId = await taskOf(messageId);
   const events = await until(taskId, "orchestration.CallRequested");
   assert.deepEqual(
     events.map((event) => [event.type, event.causationId]),
     [
       ["orchestration.TaskSubmitted", sourceId],
-      ["orchestration.RunStarted", sourceId],
       ["orchestration.CallRequested", sourceId],
     ],
   );
@@ -370,39 +403,75 @@ test("a new_task message runs the writer: TaskSubmitted, RunStarted, CallRequest
     conversationId,
     messageId,
   });
-  const call = events[2]?.payload ?? {};
-  assert.equal(call.maxCostMicroUsd, 50_000);
-  const [, user] = call.messages as { content: string }[];
+  const planCall = events[1]?.payload ?? {};
+  assert.equal(planCall.kind, "plan");
+  assert.equal(planCall.agentId, orchestratorAgent.agentId);
+  assert.equal(planCall.maxCostMicroUsd, 50_000);
+  const [system, user] = planCall.messages as { content: string }[];
+  assert.equal(system?.content, "You are the orchestrator.");
   const blockId = /BEGIN DATA owner_message (\S+)\n/.exec(user?.content ?? "")?.[1];
   assert.ok(blockId !== undefined && blockId !== messageId);
-  assert.deepEqual(call.messages, [
-    { role: "system", content: "You are the writer agent." },
-    {
-      role: "user",
-      content: `Answer the owner's chat message. It is in the data block below.\nBEGIN DATA owner_message ${blockId}\nWrite a poem\nEND DATA owner_message ${blockId}`,
-    },
-  ]);
-  await published(String(events[2]?._id));
-  assert.equal((await streamMessages(String(events[2]?._id))).length, 1);
-  const { callId } = await callOf(taskId);
-  const llmEventId = randomUUID();
-  await llm("CallStarted", taskId, callId, {
-    agentId: writerAgent.agentId,
-    agentVersion: 1,
-    reservationId: randomUUID(),
-  });
-  await llm("CallCompleted", taskId, callId, completedCall("A short poem."), llmEventId);
+  assert.ok(
+    user?.content.endsWith(
+      `BEGIN DATA owner_message ${blockId}\nWrite a poem\nEND DATA owner_message ${blockId}`,
+    ),
+  );
+  await published(String(events[1]?._id));
+  assert.equal((await streamMessages(String(events[1]?._id))).length, 1);
+  const answers = [onePlan, "The poem.", "The answer (step 1): the poem.", '{"pass": true}'];
+  const kinds: unknown[] = [];
+  for (const [index, text] of answers.entries()) {
+    const call = await lastCall(taskId, index + 1);
+    kinds.push(call.payload.kind);
+    await llm("CallStarted", taskId, String(call.payload.callId), {
+      agentId: call.payload.agentId,
+      agentVersion: 1,
+      reservationId: randomUUID(),
+    });
+    await llm("CallCompleted", taskId, String(call.payload.callId), completedCall(text));
+  }
+  assert.deepEqual(kinds, ["plan", "subtask", "aggregate", "check"]);
   const done = await until(taskId, "orchestration.RunCompleted");
-  assert.deepEqual(done.at(-1)?.payload, {
-    taskId,
-    runId: events[1]?.payload.runId,
-    summary: "A short poem.",
-    costMicroUsd: 21,
-  });
-  assert.equal(done.at(-1)?.causationId, llmEventId);
+  assert.equal(done.at(-1)?.payload.summary, "The answer (step 1): the poem.");
+  assert.equal(done.at(-1)?.payload.costMicroUsd, 21);
+  assert.equal(done.filter((event) => event.type === "orchestration.CallSettled").length, 4);
 });
 
-test("a budget refusal blocks the run, and a steer for the blocked task is refused", async () => {
+test("approval is the default mode, and questions wait for the answer of the owner", async () => {
+  const messageId = randomUUID();
+  await post({ messageId, intent: "new_task" });
+  const taskId = await taskOf(messageId);
+  const first = await lastCall(taskId, 1);
+  await llm(
+    "CallCompleted",
+    taskId,
+    String(first.payload.callId),
+    completedCall('{"questions": ["About what?"]}'),
+  );
+  await until(taskId, "orchestration.ClarificationRequested");
+  const answerId = randomUUID();
+  await post({ messageId: answerId, intent: "answer", taskId, text: "The sea." });
+  const second = await lastCall(taskId, 2);
+  await llm("CallCompleted", taskId, String(second.payload.callId), completedCall(onePlan));
+  const proposed = await until(taskId, "orchestration.PlanProposed");
+  assert.deepEqual(
+    proposed.map((event) => event.type.replace("orchestration.", "")),
+    [
+      "TaskSubmitted",
+      "CallRequested",
+      "CallSettled",
+      "ClarificationRequested",
+      "ClarificationAnswered",
+      "CallRequested",
+      "CallSettled",
+      "PlanProposed",
+    ],
+  );
+  assert.equal(proposed.at(-1)?.payload.awaitsApproval, true);
+  assert.equal(proposed[4]?.payload.messageId, answerId);
+});
+
+test("a budget refusal of the plan call fails the task, and a later steer is refused", async () => {
   const messageId = randomUUID();
   await post({ messageId, intent: "new_task" });
   const taskId = await taskOf(messageId);
@@ -413,26 +482,22 @@ test("a budget refusal blocks the run, and a steer for the blocked task is refus
     costMicroUsd: 0,
     reservationId: randomUUID(),
   });
-  const blocked = await until(taskId, "orchestration.RunBlocked");
-  assert.deepEqual(blocked.at(-1)?.payload.code, "budget_refused");
+  const failed = await until(taskId, "orchestration.RunFailed");
+  assert.equal(failed.at(-1)?.payload.code, "budget_refused");
   assert.equal(
-    blocked.at(-1)?.payload.reason,
-    "The budget refused the call: No monthly cap is set",
+    failed.at(-1)?.payload.reason,
+    "The budget refused the plan call: No monthly cap is set",
   );
   const steerId = randomUUID();
   await post({ messageId: steerId, intent: "steer", taskId, text: "Go on" });
   const refused = await until(taskId, "orchestration.MessageRefused");
-  assert.deepEqual(refused.at(-1)?.payload, {
-    taskId,
-    conversationId,
-    messageId: steerId,
-    intent: "steer",
-    reason:
-      "The task is blocked until the owner acts. Send the message as a new task. The reason: The budget refused the call: No monthly cap is set",
-  });
+  assert.equal(
+    refused.at(-1)?.payload.reason,
+    "The task has ended. Send the message as a new task.",
+  );
 });
 
-test("a failover attempt gives nothing; an empty last answer fails the run", async () => {
+test("a failover attempt gives nothing; an empty last answer gives one more plan call", async () => {
   const messageId = randomUUID();
   await post({ messageId, intent: "new_task" });
   const taskId = await taskOf(messageId);
@@ -444,9 +509,9 @@ test("a failover attempt gives nothing; an empty last answer fails the run", asy
     nextModel: "openai/gpt-4.1-nano",
   });
   await llm("CallCompleted", taskId, callId, { ...completedCall("  "), attempt: 2 });
-  const failed = await until(taskId, "orchestration.RunFailed");
-  assert.equal(failed.length, 4);
-  assert.equal(failed.at(-1)?.payload.code, "empty_output");
+  const retry = await lastCall(taskId, 2);
+  assert.equal(retry.payload.kind, "plan");
+  assert.equal((await streamOf(taskId)).length, 4);
 });
 
 test("each consumed event is handled once: a redelivered message and call end", async () => {
@@ -457,9 +522,9 @@ test("each consumed event is handled once: a redelivered message and call end", 
   const taskId = await taskOf(messageId);
   const { callId } = await callOf(taskId);
   const endId = randomUUID();
-  await llm("CallCompleted", taskId, callId, completedCall("Once."), endId);
-  await until(taskId, "orchestration.RunCompleted");
-  await llm("CallCompleted", taskId, callId, completedCall("Twice."), endId, randomUUID());
+  await llm("CallCompleted", taskId, callId, completedCall(onePlan), endId);
+  await until(taskId, "orchestration.PlanProposed");
+  await llm("CallCompleted", taskId, callId, completedCall(onePlan), endId, randomUUID());
   await consumed("CONVERSATION");
   await consumed("LLM");
   assert.equal((await manager.streams.info("DLQ")).state.messages, 0);
@@ -471,12 +536,12 @@ test("each consumed event is handled once: a redelivered message and call end", 
     1,
   );
   assert.equal(
-    (await streamOf(taskId)).filter((event) => event.type === "orchestration.RunCompleted").length,
+    (await streamOf(taskId)).filter((event) => event.type === "orchestration.PlanProposed").length,
     1,
   );
 });
 
-test("no active writer version fails the run with not_found", async () => {
+test("no active orchestrator version fails the task with not_found", async () => {
   agentAnswer = [404, { code: "not_found" }];
   try {
     const messageId = randomUUID();
@@ -485,15 +550,15 @@ test("no active writer version fails the run with not_found", async () => {
     const events = await until(taskId, "orchestration.RunFailed");
     assert.deepEqual(
       events.map((event) => event.type),
-      ["orchestration.TaskSubmitted", "orchestration.RunStarted", "orchestration.RunFailed"],
+      ["orchestration.TaskSubmitted", "orchestration.RunFailed"],
     );
     assert.equal(events.at(-1)?.payload.code, "not_found");
   } finally {
-    agentAnswer = [200, writerAgent];
+    agentAnswer = [200, orchestratorAgent];
   }
 });
 
-test("agent-manager with 5xx after the retries fails the run with unavailable and a reply", async () => {
+test("agent-manager with 5xx after the retries fails the task with unavailable and a reply", async () => {
   agentAnswer = [503, { code: "unavailable" }];
   try {
     const messageId = randomUUID();
@@ -503,11 +568,11 @@ test("agent-manager with 5xx after the retries fails the run with unavailable an
     assert.equal(events.at(-1)?.payload.code, "unavailable");
     assert.match(String(events.at(-1)?.payload.reason), /Try again in a minute\.$/);
   } finally {
-    agentAnswer = [200, writerAgent];
+    agentAnswer = [200, orchestratorAgent];
   }
 });
 
-test("a planned run: the timer starts a due retry, the output goes to the dependent, and the run completes", async () => {
+test("a planned run with no orchestrator: the timer starts a due retry, the output goes to the dependent, and the run completes with the outputs", async () => {
   const taskId = randomUUID();
   const runId = randomUUID();
   const [first, second] = [randomUUID(), randomUUID()];
