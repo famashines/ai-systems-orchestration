@@ -27,6 +27,7 @@ import {
   failedCodes,
   fold,
   reason,
+  taskLimits,
   type AgentLoad,
   type LoadFailure,
   type TaskEvent,
@@ -61,8 +62,8 @@ export function maxSubtasks(
   settings: Pick<RunSettings, "maxCallsPerTask">,
 ): number {
   const byCalls = settings.maxCallsPerTask - Object.keys(state.calls).length - 1 - reworkCalls;
-  const byMoney =
-    Math.floor((limits.maxCostMicroUsd - state.costMicroUsd) / estimate(limits)) - 1 - reworkCalls;
+  const rest = taskLimits(state, limits).maxCostMicroUsd - state.costMicroUsd;
+  const byMoney = Math.floor(rest / estimate(limits)) - 1 - reworkCalls;
   return Math.max(1, Math.min(20, byCalls, byMoney));
 }
 
@@ -243,7 +244,7 @@ function readPlan(state: TaskState, text: string, env: RunEnv): PlanResult {
       title: item.title,
       instructions: item.instructions,
       agentId: load.agent.agentId,
-      ...(item.model === undefined ? {} : { model: item.model }),
+      ...(item.model === undefined || state.model !== undefined ? {} : { model: item.model }),
       dependsOn,
       needsApproval: item.needsApproval,
     });
@@ -328,7 +329,7 @@ function checkBudget(
     estimates.reduce((sum, value) => sum + value, 0) +
     Math.max(...estimates) +
     3 * estimate(limits);
-  const rest = limits.maxCostMicroUsd - state.costMicroUsd;
+  const rest = taskLimits(state, limits).maxCostMicroUsd - state.costMicroUsd;
   if (total > rest) {
     return {
       refused: `The plan needs up to ${String(total)} micro-USD with the final answer, its check and one rework, but the task has ${String(rest)} micro-USD left. Use fewer subtasks.`,

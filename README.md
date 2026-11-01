@@ -38,7 +38,7 @@ projections --GET /internal/events--> orchestration (rebuild only)
 
 Architecture and reasons: `ai-systems-docs` (`ARCHITECTURE.md` 5 to 8,
 ADR 0006, 0007, 0015, 0021, 0023, 0027). Schemas:
-`@famashines/ai-systems-contracts` v0.4.1.
+`@famashines/ai-systems-contracts` v0.5.0.
 
 ## Chat tasks
 
@@ -69,7 +69,7 @@ OwnerMessagePosted{intent: new_task}
   --> GET agent-manager: active version of "orchestrator" (by name)
   --> GET prompt-studio: its prompt version
   --> one append to task-<new taskId>:
-      TaskSubmitted{mode, conversationId, messageId}, CallRequested{kind: plan}
+      TaskSubmitted{mode, model, effort, conversationId, messageId}, CallRequested{kind: plan}
 ```
 
 | Case                                                                        | Events after `TaskSubmitted`                                                                                                                         |
@@ -93,6 +93,38 @@ task: a `RunBlocked` with no run cannot be resumed or cancelled.
 The calls of a task (`plan`, `subtask`, `aggregate`, `check`) all have a
 `kind`, so each call gets `CallSettled` and projections counts its cost.
 
+### Task model and effort
+
+`OwnerMessagePosted` (`new_task`) can have a `model` and an `effort` of
+the owner. `TaskSubmitted` keeps them. A task with no `model` is an auto
+task: each call uses the model chain and the limits of its agent, with no
+effort, as before.
+
+The `model` applies to all calls of the task: plan, subtasks, aggregate
+and check.
+
+| Call of a task with a model                                           | `models`        | `effort`        |
+| --------------------------------------------------------------------- | --------------- | --------------- |
+| plan, aggregate, check, and a subtask with no `model`                 | `[task model]`  | the task effort |
+| a subtask with a `model` of the owner (`EditPlan`, `ReassignSubtask`) | `[owner model]` | none            |
+
+- Orchestration drops a `model` that the planner names. So a subtask
+  `model` comes only from the owner, and it must be a model of its agent.
+- `checkPlan` does not use the task model. A task model that no agent
+  has is valid.
+- Each call of the task has `maxTokens` 32000 and `maxDurationMs`
+  300000 (300 s), also a subtask with a model of the owner.
+- The task allowance is 1,000,000 micro-USD (1 USD), in place of the
+  `limits.maxCostMicroUsd` of the agent. Orchestration uses it for the
+  `maxCostMicroUsd` of each call, the runaway rules, the plan budget
+  check, `maxSubtasks` and the rework rule.
+- `maxCalls` stays the agent value.
+- The estimates of a subtask do not change: they are the agent rule
+  (below), also for a task with a model.
+- The month cap of budget applies to all spend.
+- `SubmitTask` (`POST /internal/commands/submit-task`) has no model, so
+  its task is an auto task.
+
 ### Planning
 
 The plan call:
@@ -101,8 +133,9 @@ The plan call:
 | ------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | `agentId`, `agentVersion` | the active `orchestrator` version. Later calls of the task load it again by the `agentId` of the plan call |
 | `messages`                | below                                                                                                      |
-| `models`, `maxTokens`     | from the agent version                                                                                     |
+| `models`, `maxTokens`     | from the agent version (a task with a model: `[task model]`, 32000)                                        |
 | `maxCostMicroUsd`         | the rest of the orchestrator allowance: `limits.maxCostMicroUsd` minus the cost of the task so far         |
+| `effort`                  | the task effort, when the task has one                                                                     |
 
 ```
 system: the prompt text of the orchestrator
@@ -259,7 +292,7 @@ So a call that never ends (for example a call that ai-proxy sent to its
 The run process manager (task M3-02) is pure: `decide` and `schedule` in
 `src/domain/run.ts`, with the state from `evolve` in
 `src/domain/state.ts`. The table test `test/unit/run.test.ts` has a row
-for each line of the status table of contracts v0.4.1, and a test for each
+for each line of the status table of contracts v0.5.0, and a test for each
 input in each state.
 
 ```
@@ -368,7 +401,8 @@ Runaway rules (ADR 0015, base) before each try give `SubtaskBlocked`
 
 - the task made `MAX_CALLS_PER_TASK` calls (default 50);
 - the calls of the task with that agent reach `limits.maxCalls`;
-- the task cost reaches `limits.maxCostMicroUsd`.
+- the task cost reaches `limits.maxCostMicroUsd` (1,000,000 for a task
+  with a model).
 
 The rule "the same request hash 3 times in one subtask" is M4.
 
@@ -379,7 +413,9 @@ writer read). Each start loads it again, so a try uses the active version.
 slot.
 A read that fails as `unavailable` is a failed try with a retry. `not_found`,
 `internal`, an agent that is off, or a prompt with variables is a failed
-try with no retry. A plan subtask with a `model` uses only that model.
+try with no retry. A plan subtask with a `model` uses only that model,
+with no effort. A subtask with no `model` uses the task model, or the
+model chain of its agent in an auto task.
 
 ### Data blocks of a subtask call
 
@@ -524,7 +560,7 @@ Errors are RFC 9457 problem JSON with a `code` (`@famashines/ai-systems-kit/http
 ### `POST /internal/commands/submit-task`
 
 The body is a `CommandEnvelopeV1` with a `SubmitTaskCommandPayloadV1`
-(`@famashines/ai-systems-contracts` v0.4.1):
+(`@famashines/ai-systems-contracts` v0.5.0):
 
 ```json
 {
@@ -568,7 +604,7 @@ MongoDB transaction.
 `POST /internal/commands/<command>`, where `<command>` is the command name
 in kebab case:
 
-| Path                 | `type`                            | Payload (contracts v0.4.1)          |
+| Path                 | `type`                            | Payload (contracts v0.5.0)          |
 | -------------------- | --------------------------------- | ----------------------------------- |
 | `approve-plan`       | `orchestration.ApprovePlan`       | `ApprovePlanCommandPayloadV1`       |
 | `edit-plan`          | `orchestration.EditPlan`          | `EditPlanCommandPayloadV1`          |
@@ -822,6 +858,8 @@ Commands for agents: `CLAUDE.md`.
 - A subtask call with no end keeps its subtask `running`: there is no
   stale rule for subtask calls. A `SubtaskStarted` timer is an M4 item.
   The owner can cancel the run (M3-04).
+- A task with a model has a chain of one model, so ai-proxy has no next
+  model to try. The subtask retries still apply.
 - The plan estimates are a provisional rule from `AgentLimits`
   (allowance over calls), not prices. Real estimates need the model
   catalog (ADR 0027, BUD-4).

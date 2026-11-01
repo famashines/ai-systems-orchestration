@@ -27,6 +27,8 @@ export async function onOwnerMessage(
         mode: payload.mode ?? "approval",
         message,
         orchestrator,
+        model: payload.model,
+        effort: payload.effort,
       },
       actorOf: (created) => (created.type === "orchestration.TaskSubmitted" ? event.actor : system),
       also: markProcessed,

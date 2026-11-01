@@ -1,6 +1,7 @@
 import type {
   CallCompletedEventPayloadV1,
   CallFailedEventPayloadV1,
+  ReasoningEffort,
   TaskMode,
 } from "@famashines/ai-systems-contracts";
 import { agentNames, isPlanCall, planCall, settlePlan } from "./plan.ts";
@@ -52,6 +53,8 @@ export interface StartChatTask {
   mode: TaskMode;
   message: ChatMessage;
   orchestrator: AgentLoad;
+  model?: string | undefined;
+  effort?: ReasoningEffort | undefined;
 }
 
 export interface TakeMessage {
@@ -76,7 +79,7 @@ export type TaskCommand =
 
 function startChatTask(
   state: TaskState,
-  { taskId, mode, message, orchestrator }: StartChatTask,
+  { taskId, mode, message, orchestrator, model, effort }: StartChatTask,
   env: RunEnv,
 ): TaskEvent[] {
   const submitted = event("orchestration.TaskSubmitted", {
@@ -85,6 +88,8 @@ function startChatTask(
     mode,
     conversationId: message.conversationId,
     messageId: message.messageId,
+    ...(model === undefined ? {} : { model }),
+    ...(effort === undefined ? {} : { effort }),
   });
   return [submitted, ...planCall(fold(state, [submitted]), orchestrator, env)];
 }

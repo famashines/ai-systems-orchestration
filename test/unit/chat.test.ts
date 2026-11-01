@@ -186,6 +186,19 @@ test("a new_task message gives TaskSubmitted and a plan call of the orchestrator
   assert.equal(marked.length, 1);
 });
 
+test("a new_task message with a model and an effort gives them to TaskSubmitted and the plan call", async () => {
+  const { store, deps } = setup();
+  const model = "anthropic/claude-opus-4.8";
+  const { taskId } = await newTask(deps, store, { model, effort: "high" });
+  const [submitted, call] = await store.readStream(`task-${taskId}`);
+  assert.equal(submitted?.type, "orchestration.TaskSubmitted");
+  assert.equal(submitted.payload.model, model);
+  assert.equal(submitted.payload.effort, "high");
+  assert.equal(call?.type, "orchestration.CallRequested");
+  assert.deepEqual(call.payload.models, [model]);
+  assert.equal(call.payload.effort, "high");
+});
+
 test("approval mode: a valid plan gives PlanProposed that awaits approval, with CallSettled", async () => {
   const { store, deps } = setup();
   const { taskId } = await newTask(deps, store);

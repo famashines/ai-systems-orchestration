@@ -23,6 +23,7 @@ import {
   PlanRefusedError,
   reason,
   runningCalls,
+  taskLimits,
   TaskConflictError,
   type AgentLoad,
   type CallState,
@@ -34,6 +35,7 @@ import {
 
 export const maxTries = 3;
 export const callDurationMs = 120_000;
+export const modelCallDurationMs = 300_000;
 
 export interface RunSettings {
   maxParallel: number;
@@ -357,11 +359,12 @@ export function prepareCall(
       },
     };
   }
+  const limits = taskLimits(state, agent.limits);
   const calls = Object.values(state.calls);
   const next =
     calls.length >= env.settings.maxCallsPerTask
       ? { stop: `The task made ${String(calls.length)} calls, the limit of a task.` }
-      : nextCall(agent.limits, {
+      : nextCall(limits, {
           calls: calls.filter((call) => call.agentId === agent.agentId).length,
           costMicroUsd: state.costMicroUsd,
         });
@@ -376,12 +379,16 @@ export function prepareCall(
     agentId: agent.agentId,
     agentVersion: agent.version,
     messages: spec.messages(prompt, agent),
-    models: spec.models ?? agent.models,
-    maxTokens: agent.limits.maxTokens,
-    maxDurationMs: callDurationMs,
+    models: spec.models ?? (state.model === undefined ? agent.models : [state.model]),
+    maxTokens: limits.maxTokens,
+    maxDurationMs: state.model === undefined ? callDurationMs : modelCallDurationMs,
     maxCostMicroUsd: share === 0 ? rest : share,
     kind: spec.kind,
     ...optional("subtaskId", spec.subtaskId),
+    ...optional(
+      "effort",
+      spec.models === undefined && state.model !== undefined ? state.effort : undefined,
+    ),
   };
   const parsed = CallRequestedEventPayloadV1.safeParse(request);
   if (!parsed.success) {
@@ -550,12 +557,12 @@ function roomForRework(state: TaskState, subtaskId: string, env: RunEnv): boolea
   const same = redoLoad.agent.agentId === orchestrator.agent.agentId ? 1 : 0;
   const stopped = ({ agent }: Writer) =>
     "stop" in
-    nextCall(agent.limits, {
+    nextCall(taskLimits(state, agent.limits), {
       calls: calls.filter((call) => call.agentId === agent.agentId).length + same,
       costMicroUsd: state.costMicroUsd,
     });
   if (stopped(redoLoad) || stopped(orchestrator)) return false;
-  const rest = orchestrator.agent.limits.maxCostMicroUsd - state.costMicroUsd;
+  const rest = taskLimits(state, orchestrator.agent.limits).maxCostMicroUsd - state.costMicroUsd;
   return rest >= estimate(redoLoad.agent.limits) + estimate(orchestrator.agent.limits);
 }
 
