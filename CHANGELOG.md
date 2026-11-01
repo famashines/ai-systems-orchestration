@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Contracts v0.5.0: the owner chooses the model and the reasoning effort
+  of a chat task. `OwnerMessagePosted` (`new_task`) gives its `model` and
+  `effort` to `TaskSubmitted`. A task with a model sends `[task model]`
+  and the effort on the plan, subtask, aggregate and check calls. A
+  subtask with a model of the owner (`EditPlan`, `ReassignSubtask`) keeps
+  that model and has no effort. Orchestration drops a model that the
+  planner names, and `checkPlan` takes a task model that no agent has.
+  Each call of a task with a model has `maxTokens` 32000 and
+  `maxDurationMs` 300000. The task allowance is 1,000,000 micro-USD for
+  the call caps, the runaway rules, the plan budget check, `maxSubtasks`
+  and the rework rule. `maxCalls` and the estimates stay the agent
+  values. A task with no model does not change. Deploy after ai-proxy on
+  contracts v0.5.0.
+
 - Owner controls (task M3-04): `POST /internal/commands/<command>` for
   `approve-plan`, `edit-plan`, `reject-plan`, `pause-run`, `resume-run`,
   `cancel-run`, `cancel-task`, `retry-subtask`, `reassign-subtask`,

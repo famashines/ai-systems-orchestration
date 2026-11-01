@@ -98,12 +98,15 @@ const text = (call: Of<"orchestration.CallRequested">) =>
   call.messages.map((item) => item.content).join("\n");
 
 const message = { conversationId, messageId, text: "Write a poem about the sea." };
-const start = (over: Partial<{ mode: "auto" | "approval"; text: string }> = {}): TaskCommand => ({
+type Start = Partial<{ mode: "auto" | "approval"; text: string; model: string; effort: "high" }>;
+const start = (over: Start = {}): TaskCommand => ({
   type: "StartChatTask",
   taskId,
   mode: over.mode ?? "approval",
   message: { ...message, ...(over.text === undefined ? {} : { text: over.text }) },
   orchestrator,
+  model: over.model,
+  effort: over.effort,
 });
 
 const completed = (callId: string, output: string, costMicroUsd = 100): TaskCommand => ({
@@ -131,8 +134,7 @@ const failedCall = (
   call: { taskId, callId, attempt: 1, model, errorClass, reason: "HTTP 500", costMicroUsd: 3 },
 });
 
-const planned = (over: Partial<{ mode: "auto" | "approval"; text: string }> = {}) =>
-  handle([], start(over));
+const planned = (over: Start = {}) => handle([], start(over));
 const answerPlan = (
   output: string,
   over: Parameters<typeof planned>[0] = {},
@@ -909,6 +911,123 @@ test("checkPlan checks a plan of agent ids for EditPlan: unknown agents, the est
       failed: { code: "internal", reason: "The orchestrator agent is not known." },
     },
   );
+});
+
+const taskModel = "anthropic/claude-opus-4.8";
+const withModel = { model: taskModel, effort: "high" as const };
+
+const modelCall = (call: Of<"orchestration.CallRequested">, maxCostMicroUsd: number) => {
+  assert.ok(CallRequestedEventPayloadV1.safeParse(call).success);
+  assert.deepEqual(
+    [call.models, call.effort, call.maxTokens, call.maxDurationMs, call.maxCostMicroUsd],
+    [[taskModel], "high", 32_000, 300_000, maxCostMicroUsd],
+  );
+};
+
+test("a task with a model: each call has only the task model, the effort and the task limits", () => {
+  const first = planned({ mode: "auto", ...withModel });
+  assert.deepEqual(first.events[0]?.payload, {
+    taskId,
+    ...message,
+    mode: "auto",
+    ...withModel,
+  });
+  assert.equal(first.state.model, taskModel);
+  assert.equal(first.state.effort, "high");
+  modelCall(lastCall(first.events), 1_000_000);
+  const run = handle(
+    first.history,
+    completed(lastCall(first.events).callId, plan(sub({ model: "openai/gpt-4.1-nano" }))),
+  );
+  const [subtask] = find(run.events, "orchestration.PlanProposed").subtasks;
+  assert.ok(subtask);
+  assert.equal(subtask.model, undefined);
+  assert.equal(subtask.estimatedCostMicroUsd, 5000);
+  assert.equal(subtask.estimatedDurationMs, 120_000);
+  const call = lastCall(run.events);
+  assert.equal(call.kind, "subtask");
+  modelCall(call, 999_900);
+  const aggregated = finish(run.history, [["Out.", 60_000]]);
+  assert.equal(lastCall(aggregated.events).kind, "aggregate");
+  modelCall(lastCall(aggregated.events), 939_900);
+  const checked = finish(aggregated.history, ["Final."]);
+  assert.equal(lastCall(checked.events).kind, "check");
+  modelCall(lastCall(checked.events), 939_800);
+  const verdict = JSON.stringify({ pass: false, step: 1, feedback: "Again." });
+  const rework = finish(checked.history, [verdict]);
+  assert.equal(types(rework.events)[1], "SubtaskQueued");
+  assert.equal(lastCall(rework.events).kind, "subtask");
+  modelCall(lastCall(rework.events), 939_700);
+});
+
+test("a task with no model uses the agent limits: a cost above its allowance stops the run", () => {
+  const run = runOf([sub()]);
+  const call = lastCall(run.events);
+  assert.deepEqual(
+    [call.models, call.effort, call.maxTokens, call.maxDurationMs],
+    [orchestrator.agent.models, undefined, 2048, 120_000],
+  );
+  const end = finish(run.history, [["Out.", 60_000]]);
+  assert.deepEqual(types(end.events), ["CallSettled", "SubtaskCompleted", "RunCompleted"]);
+});
+
+test("a task with a model: a subtask model of the owner runs with no effort and the task limits", () => {
+  const first = planned(withModel);
+  const proposed = handle(
+    first.history,
+    completed(lastCall(first.events).callId, plan(sub(), sub({ dependsOn: [1] }))),
+  );
+  const [a, b] = find(proposed.events, "orchestration.PlanProposed").subtasks;
+  assert.ok(a && b);
+  const hand = "openai/gpt-4.1-nano";
+  const edited = handle(proposed.history, {
+    type: "EditPlan",
+    planVersion: 1,
+    subtasks: [{ ...a, model: hand }, b],
+  });
+  assert.deepEqual(types(edited.events), ["PlanEdited"]);
+  const run = handle(edited.history, { type: "ApprovePlan", planVersion: 2 });
+  const call = lastCall(run.events);
+  assert.ok(CallRequestedEventPayloadV1.safeParse(call).success);
+  assert.deepEqual(
+    [call.models, call.effort, call.maxTokens, call.maxDurationMs, call.maxCostMicroUsd],
+    [[hand], undefined, 32_000, 300_000, 499_950],
+  );
+  const reassigned = handle(run.history, {
+    type: "ReassignSubtask",
+    subtaskId: b.subtaskId,
+    agentId: writer.agent.agentId,
+    model: hand,
+  });
+  assert.deepEqual(types(reassigned.events), ["SubtaskReassigned"]);
+  const next = finish(reassigned.history, ["Out."]);
+  const second = lastCall(next.events);
+  assert.equal(second.subtaskId, b.subtaskId);
+  assert.deepEqual([second.models, second.effort], [[hand], undefined]);
+});
+
+test("a task with a model: the plan check takes a model that no agent uses, and the task allowance", () => {
+  const state = fold(initialState, planned(withModel).history);
+  const auto = fold(initialState, planned().history);
+  const agents = new Map<string, AgentLoad>([
+    [orchestrator.agent.agentId, orchestrator],
+    [writer.agent.agentId, writer],
+  ]);
+  const steps = Array.from({ length: 7 }, (_, index) => ({
+    subtaskId: `00000000-0000-4000-8000-0000000000b${String(index)}`,
+    title: "Poem",
+    instructions: "Write it.",
+    agentId: writer.agent.agentId,
+    dependsOn: [],
+    needsApproval: false,
+  }));
+  const result = checkPlan(state, steps, agents, { maxCallsPerTask: 50 });
+  assert.ok("subtasks" in result);
+  assert.equal(result.subtasks[0]?.estimatedCostMicroUsd, 5000);
+  const refused = checkPlan(auto, steps, agents, { maxCallsPerTask: 50 });
+  assert.ok("refused" in refused);
+  assert.match(refused.refused, /but the task has 50000 micro-USD left/);
+  assert.equal(maxSubtasks(state, orchestrator.agent.limits, { maxCallsPerTask: 50 }), 20);
 });
 
 test("an agent-manager that does not answer after the plan call settles throws, so the event comes again", () => {

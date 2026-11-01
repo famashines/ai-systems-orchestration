@@ -7,6 +7,7 @@ import type {
   LlmErrorClass,
   PlanSubtask,
   PromptVersionResultV1,
+  ReasoningEffort,
   RegisteredEvent,
   SubtaskStatus,
   TaskMode,
@@ -78,6 +79,8 @@ export interface TaskState {
   taskId: string;
   status: TaskStatus;
   mode?: TaskMode;
+  model?: string;
+  effort?: ReasoningEffort;
   text?: string;
   conversationId?: string;
   messageId?: string;
@@ -166,6 +169,11 @@ export function nextCall(
   return { maxCostMicroUsd: rest };
 }
 
+export const taskLimits = (state: TaskState, limits: AgentLimits): AgentLimits =>
+  state.model === undefined
+    ? limits
+    : { maxCalls: limits.maxCalls, maxTokens: 32_000, maxCostMicroUsd: 1_000_000 };
+
 export const estimate = (limits: AgentLimits): number =>
   Math.ceil(limits.maxCostMicroUsd / limits.maxCalls);
 
@@ -243,7 +251,7 @@ function startBasis(state: TaskState, subtaskId: string): StartBasis {
 export function evolve(state: TaskState, event: HistoryEvent): TaskState {
   switch (event.type) {
     case "orchestration.TaskSubmitted": {
-      const { taskId, mode, text, conversationId, messageId } = event.payload;
+      const { taskId, mode, text, conversationId, messageId, model, effort } = event.payload;
       return {
         ...initialState,
         taskId,
@@ -252,6 +260,8 @@ export function evolve(state: TaskState, event: HistoryEvent): TaskState {
         text,
         ...(conversationId === undefined ? {} : { conversationId }),
         ...(messageId === undefined ? {} : { messageId }),
+        ...(model === undefined ? {} : { model }),
+        ...(effort === undefined ? {} : { effort }),
       };
     }
     case "orchestration.ClarificationRequested":
