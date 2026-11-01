@@ -788,7 +788,10 @@ and an admin user that makes the streams.
   fails), then 1 USD. The test gives the mock 4 answers for the first seed
   model, in call order: the plan JSON (one `writer` subtask), the subtask
   output, the final answer and `{"pass": true}`. The task completes with
-  the final answer. With no `E2E_DIR`, the tests are
+  the final answer. A third test sends a task in mode `approval`: the
+  plan waits, the test signs an owner token with a local key (a JWKS
+  server in the test process) and sends `approve-plan`, and the run
+  completes with the mock answers. With no `E2E_DIR`, the tests are
   skipped. The CI job `e2e` sets it.
 
 Commands for agents: `CLAUDE.md`.
