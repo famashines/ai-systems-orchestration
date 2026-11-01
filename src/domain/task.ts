@@ -150,11 +150,12 @@ function refusal(state: TaskState, intent: "steer" | "answer"): string {
     case "blocked":
       return `The task is blocked until the owner acts. Send the message as a new task. The reason: ${state.reason ?? "not known"}`;
     case "submitted":
-      return "The task does not run in the chat. Send the message as a new task.";
     case "clarifying":
     case "planning":
     case "awaiting_approval":
-      return "The task has no run yet. Send the message as a new task.";
+      return state.conversationId === undefined
+        ? "The task does not run in the chat. Send the message as a new task."
+        : "The task has not started its run yet. Wait for the plan or the questions.";
     default:
       return "The task has ended. Send the message as a new task.";
   }

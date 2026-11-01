@@ -361,8 +361,31 @@ test("other refusals: unknown, answer, ended and an API task", () => {
   );
   assert.equal(
     reasonOf(given([submitted]).when(refuse("steer"))()),
+    "The task has not started its run yet. Wait for the plan or the questions.",
+  );
+  const api: TaskEvent = {
+    type: "orchestration.TaskSubmitted",
+    schemaVersion: 1,
+    payload: { taskId, text: "Write a poem", mode: "auto" },
+  };
+  assert.equal(
+    reasonOf(given([api]).when(refuse("steer"))()),
     "The task does not run in the chat. Send the message as a new task.",
   );
+  for (const status of [
+    { type: "orchestration.ClarificationRequested", payload: { taskId, questions: ["Which?"] } },
+    {
+      type: "orchestration.PlanProposed",
+      payload: { taskId, planVersion: 1, subtasks: [], awaitsApproval: true },
+    },
+  ]) {
+    assert.equal(
+      reasonOf(
+        given([submitted, { ...status, schemaVersion: 1 } as TaskEvent]).when(refuse("steer"))(),
+      ),
+      "The task has not started its run yet. Wait for the plan or the questions.",
+    );
+  }
 });
 
 test("a long reason is cut to 1000 characters", () => {

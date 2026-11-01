@@ -832,6 +832,10 @@ test("CancelTask ends a task with no run, and cancels a running orchestrator cal
     kind: "plan",
   });
   const planning = [submitted, planCall];
+  const ended = handle(planning, { type: "CancelTask" }).history;
+  for (const late of [done(bodyId, "A plan."), failed(bodyId, "cancelled")]) {
+    assert.deepEqual(types(handle(ended, late).events), ["CallSettled"]);
+  }
   assert.deepEqual(types(handle(planning, { type: "CancelTask" }).events), [
     "TaskCancelled",
     "CallCancelRequested",
