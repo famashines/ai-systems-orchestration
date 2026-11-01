@@ -23,7 +23,16 @@ export async function submitTask(
   { commandId, actor, payload }: SubmitTaskInput,
 ): Promise<{ answer: SubmitTaskAnswer; replayed: boolean }> {
   const taskId = newId();
-  const events = decide(initialState, { type: "SubmitTask", taskId, ...payload });
+  const events = decide(
+    initialState,
+    { type: "SubmitTask", taskId, ...payload },
+    {
+      now: new Date(),
+      newId,
+      settings: { maxParallel: 1, retryDelaysMs: [], checkpointTimeoutMs: 0 },
+      agents: new Map(),
+    },
+  );
   const answer = { taskId, version: events.length };
   const result = await store.append({
     streamId: taskStreamId(taskId),

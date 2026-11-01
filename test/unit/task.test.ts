@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { CallRequestedEventPayloadV1 } from "@famashines/ai-systems-contracts";
+import { fakeIds } from "@famashines/ai-systems-kit/testing";
 import {
   callDurationMs,
   dataBlock,
@@ -11,6 +12,7 @@ import {
   staleReason,
   TaskExistsError,
   taskStreamId,
+  type RunEnv,
   type TaskCommand,
   type TaskEvent,
   type Writer,
@@ -65,11 +67,21 @@ const started: TaskEvent = {
   schemaVersion: 1,
   payload: { taskId, runId },
 };
-const requested = decide(initialState, start())[2] as TaskEvent;
+const env = (now = minutes(1)): RunEnv => ({
+  now,
+  newId: fakeIds(7),
+  settings: { maxParallel: 3, retryDelaysMs: [5000, 30000], checkpointTimeoutMs: 60_000 },
+  agents: new Map(),
+});
+
+const requested = decide(initialState, start(), env())[2] as TaskEvent;
 const running = [submitted, started, { ...requested, occurredAt: calledAt }];
 
 const given = (events: (TaskEvent & { occurredAt?: string })[]) => ({
-  when: (command: TaskCommand) => () => decide(events.reduce(evolve, initialState), command),
+  when:
+    (command: TaskCommand, now = minutes(1)) =>
+    () =>
+      decide(events.reduce(evolve, initialState), command, env(now)),
 });
 
 const completed = (text: string): TaskCommand => ({
@@ -107,12 +119,11 @@ const failed = (
   },
 });
 
-const refuse = (intent: "steer" | "answer", now = minutes(1)): TaskCommand => ({
-  type: "RefuseMessage",
+const refuse = (intent: "steer" | "answer"): TaskCommand => ({
+  type: "TakeMessage",
   taskId,
   message,
   intent,
-  now,
 });
 
 const refused = (intent: "steer" | "answer", reason: string): TaskEvent => ({
@@ -310,15 +321,22 @@ test("given a call older than 15 minutes, when a steer or an answer comes, then 
   const reason =
     "The answer did not come in 15 minutes, so the task stopped. A later answer is not shown, and its cost is still booked.";
   assert.equal(staleReason, reason);
-  assert.deepEqual(given(running).when(refuse("steer", minutes(16)))(), [
+  const cancel: TaskEvent = {
+    type: "orchestration.CallCancelRequested",
+    schemaVersion: 1,
+    payload: { taskId, callId },
+  };
+  assert.deepEqual(given(running).when(refuse("steer"), minutes(16))(), [
     runFailed("unavailable", reason),
+    cancel,
     refused("steer", "The task has ended. Send the message as a new task."),
   ]);
-  assert.deepEqual(given(running).when(refuse("answer", minutes(16)))(), [
+  assert.deepEqual(given(running).when(refuse("answer"), minutes(16))(), [
     runFailed("unavailable", reason),
+    cancel,
     refused("answer", "The task has no open question."),
   ]);
-  assert.deepEqual(given(running).when(refuse("steer", minutes(15)))().length, 1);
+  assert.deepEqual(given(running).when(refuse("steer"), minutes(15))().length, 1);
 });
 
 test("given a blocked task, when a steer comes, then MessageRefused with the block reason", () => {

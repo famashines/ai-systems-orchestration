@@ -12,12 +12,16 @@ import { connectMongo, runMigrations } from "@famashines/ai-systems-kit/mongo";
 import { createLogger, startTelemetry } from "@famashines/ai-systems-kit/observability";
 import { z } from "zod";
 import { routes } from "./adapters/http.ts";
-import { writerLoader } from "./adapters/writer.ts";
+import { startTimers, timersMigration } from "./adapters/timers.ts";
+import { agentByIdLoader, writerLoader } from "./adapters/writer.ts";
 import { onLlmEvent, onOwnerMessage, type ChatDeps } from "./application/chat.ts";
+import { onTimer } from "./application/run.ts";
 
 export const service = "orchestration";
 
 const httpUrl = z.url({ protocol: /^https?$/ });
+const int = (fallback: string, schema: z.ZodInt) =>
+  z.string().regex(/^\d+$/).default(fallback).transform(Number).pipe(schema);
 
 export const envSchema = commonEnv.omit({ SERVICE_NAME: true }).extend({
   MONGODB_URI: z.string().min(1),
@@ -36,6 +40,21 @@ export const envSchema = commonEnv.omit({ SERVICE_NAME: true }).extend({
   NATS_PASSWORD: z.string().min(1),
   AGENT_MANAGER_URL: httpUrl.default("http://ai-systems-agent-manager:8080"),
   PROMPT_STUDIO_URL: httpUrl.default("http://ai-systems-prompt-studio:8080"),
+  MAX_PARALLEL_SUBTASKS: int("3", z.int().min(1).max(20)),
+  SUBTASK_RETRY_DELAYS_MS: z
+    .string()
+    .regex(/^\d+,\d+$/)
+    .default("5000,30000")
+    .transform((value) => value.split(",").map(Number))
+    .pipe(z.array(z.int().min(1).max(3_600_000))),
+  CHECKPOINT_TIMEOUT_MS: int(
+    "86400000",
+    z
+      .int()
+      .min(60_000)
+      .max(30 * 86_400_000),
+  ),
+  TIMER_INTERVAL_MS: int("1000", z.int().min(100).max(60_000)),
   OTEL_EXPORTER_OTLP_ENDPOINT: z.url().optional(),
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: z.url().optional(),
 });
@@ -52,7 +71,7 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
     database: config.MONGODB_DATABASE,
     clientOptions: { serverSelectionTimeoutMS: 5000 },
   });
-  const migrations = [eventStoreMigration, processedMigration];
+  const migrations = [eventStoreMigration, processedMigration, timersMigration];
   await runMigrations(mongo.db, migrations);
   const store = createEventStore(mongo.db);
   logger.info("connecting to NATS");
@@ -64,17 +83,30 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
     logger,
   });
   const relay = startRelay({ store, nats, streams: ["ORCHESTRATION"] });
+  const sources = {
+    logger,
+    agentManagerUrl: config.AGENT_MANAGER_URL,
+    promptStudioUrl: config.PROMPT_STUDIO_URL,
+  };
   const chat: ChatDeps = {
     store,
     newId: randomUUID,
     now: () => new Date(),
     logger,
-    loadWriter: writerLoader({
-      logger,
-      agentManagerUrl: config.AGENT_MANAGER_URL,
-      promptStudioUrl: config.PROMPT_STUDIO_URL,
-    }),
+    settings: {
+      maxParallel: config.MAX_PARALLEL_SUBTASKS,
+      retryDelaysMs: config.SUBTASK_RETRY_DELAYS_MS,
+      checkpointTimeoutMs: config.CHECKPOINT_TIMEOUT_MS,
+    },
+    loadWriter: writerLoader(sources),
+    loadAgent: agentByIdLoader(sources),
   };
+  const timers = startTimers({
+    db: mongo.db,
+    intervalMs: config.TIMER_INTERVAL_MS,
+    logger,
+    handle: (timer, also) => onTimer(chat, timer, also),
+  });
   const consumers = [
     startConsumer({
       nats,
@@ -110,6 +142,7 @@ export async function start(config: Readonly<Config>, options: { drainDelayMs?: 
       mongo.close,
       nats.close,
       relay.close,
+      timers.close,
       ...consumers.map((consumer) => consumer.close),
     ],
     ...options,

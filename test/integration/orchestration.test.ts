@@ -42,9 +42,11 @@ const fakes = await (async () => {
     const [status, body] =
       request.url === "/internal/agents/by-name/writer/active-version"
         ? agentAnswer
-        : request.url === `/internal/prompts/${promptId}/versions/1`
-          ? [200, writerPrompt]
-          : [404, {}];
+        : request.url === `/internal/agents/${writerAgent.agentId}/active-version`
+          ? [200, writerAgent]
+          : request.url === `/internal/prompts/${promptId}/versions/1`
+            ? [200, writerPrompt]
+            : [404, {}];
     response.writeHead(status, { "content-type": "application/json" });
     response.end(JSON.stringify(body));
   });
@@ -500,4 +502,106 @@ test("agent-manager with 5xx after the retries fails the run with unavailable an
   } finally {
     agentAnswer = [200, writerAgent];
   }
+});
+
+test("a planned run: the timer starts a due retry, the output goes to the dependent, and the run completes", async () => {
+  const taskId = randomUUID();
+  const runId = randomUUID();
+  const [first, second] = [randomUUID(), randomUUID()];
+  const subtask = (subtaskId: string, title: string, dependsOn: string[]) => ({
+    subtaskId,
+    title,
+    instructions: `Do ${title}.`,
+    agentId: writerAgent.agentId,
+    dependsOn,
+    needsApproval: false,
+  });
+  const ids = { taskId, runId, subtaskId: first };
+  const history: [string, object][] = [
+    ["TaskSubmitted", { taskId, text: "Write a report", mode: "auto" }],
+    [
+      "PlanProposed",
+      {
+        taskId,
+        planVersion: 1,
+        subtasks: [subtask(first, "Facts", []), subtask(second, "Text", [first])],
+        awaitsApproval: false,
+      },
+    ],
+    ["PlanApproved", { taskId, planVersion: 1 }],
+    ["RunStarted", { taskId, runId }],
+    ["SubtaskQueued", ids],
+    ["SubtaskWaiting", { ...ids, subtaskId: second }],
+    [
+      "SubtaskFailed",
+      {
+        ...ids,
+        tryNumber: 1,
+        code: "unavailable",
+        reason: "x",
+        inputTokens: 0,
+        outputTokens: 0,
+        costMicroUsd: 0,
+      },
+    ],
+    ["SubtaskRetrying", { ...ids, tryNumber: 2, retryAt: new Date().toISOString() }],
+  ];
+  const appended = await createEventStore(mongo.db).append({
+    streamId: `task-${taskId}`,
+    expectedVersion: 0,
+    events: history.map(([type, payload]) => ({
+      type: `orchestration.${type}`,
+      schemaVersion: 1,
+      payload,
+      correlationId: taskId,
+      causationId: taskId,
+      actor: { kind: "system", id: "test" },
+    })) as never,
+  });
+  const timerId = appended.events.at(-1)?.eventId ?? "";
+  const retried = await until(taskId, "orchestration.SubtaskStarted");
+  const startedTry = retried.find((event) => event.type === "orchestration.SubtaskStarted");
+  assert.ok(startedTry);
+  assert.equal(startedTry.payload.tryNumber, 2);
+  assert.equal(startedTry.causationId, timerId);
+  await waitFor(
+    async () =>
+      (await mongo.db.collection("processed").countDocuments({ _id: timerId as never })) === 1,
+  );
+  const firstCall = String(startedTry.payload.callId);
+  await llm("CallCompleted", taskId, firstCall, {
+    ...completedCall("The facts."),
+    callInputTokens: 12,
+    callOutputTokens: 3,
+    callCostMicroUsd: 21,
+  });
+  await waitFor(async () =>
+    (await streamOf(taskId)).some(
+      (event) =>
+        event.type === "orchestration.SubtaskStarted" && event.payload.subtaskId === second,
+    ),
+  );
+  const middle = await streamOf(taskId);
+  const secondCall = middle.findLast((event) => event.type === "orchestration.CallRequested");
+  assert.ok(secondCall);
+  assert.equal(secondCall.payload.maxCostMicroUsd, 50_000 - 21);
+  assert.equal(secondCall.payload.kind, "subtask");
+  await llm("CallCompleted", taskId, String(secondCall.payload.callId), completedCall("The text."));
+  const done = await until(taskId, "orchestration.RunCompleted");
+  assert.deepEqual(
+    done.slice(history.length).map((event) => event.type.replace("orchestration.", "")),
+    [
+      "SubtaskStarted",
+      "CallRequested",
+      "CallSettled",
+      "SubtaskCompleted",
+      "SubtaskQueued",
+      "SubtaskStarted",
+      "CallRequested",
+      "CallSettled",
+      "SubtaskCompleted",
+      "RunCompleted",
+    ],
+  );
+  assert.equal(done.at(-1)?.payload.summary, "## Facts\n\nThe facts.\n\n## Text\n\nThe text.");
 });
