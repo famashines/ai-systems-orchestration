@@ -54,7 +54,10 @@ for all included files together:
 
 `test/unit/run.test.ts` is the table test of the run process manager:
 one row for each line of the contracts status table, and a test for each
-input in each state. Add a row or a test for each new event or input.
+input in each state. `test/unit/matrix.test.ts` has the expected result
+of each input in each task state, for a planned and a chat task (the
+histories are in `test/unit/matrix.ts`). Add a row, a test or a matrix
+column for each new event or input.
 
 `main.ts` is wiring. The integration test covers it through `start()`.
 
