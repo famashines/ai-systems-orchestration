@@ -20,11 +20,15 @@ Rules for all ai-systems repos: `ai-systems-docs/CLAUDE.md`
 
 ```
 src
-├── domain/task.ts             decide, evolve, data block, runaway rules, no I/O
+├── domain/state.ts            task state, evolve (the status table), runaway rules, no I/O
+├── domain/run.ts              run process manager: decideRun, schedule, subtask calls, no I/O
+├── domain/task.ts             decide (M2 chat path and dispatch), steer and refusals, no I/O
+├── application/run.ts         act (read, decide, load agents, schedule, append), onTimer
 ├── application/submit-task.ts the command handler
 ├── application/chat.ts        the handlers of OwnerMessagePosted and llm.*
 ├── adapters/http.ts           routes, zod schemas of the bodies and queries
-├── adapters/writer.ts         reads of agent-manager and prompt-studio
+├── adapters/timers.ts         timer loop over SubtaskRetrying and CheckpointOpened, migration 001-timers
+├── adapters/writer.ts         reads of agent-manager (by name, by id) and prompt-studio
 └── main.ts                    config, wiring by constructor, start, shutdown
 test
 ├── nats.ts                    gitops NATS grants and streams for the tests
@@ -33,9 +37,12 @@ test
 └── e2e                        the real sibling services (E2E_DIR), the ai-proxy mock
 ```
 
-No own migrations yet: orchestration has only the kit collections
-(`events`, `commands`, `counters`, `processed`; ARCHITECTURE 7). An own index script goes in `src/migrations/NNN-name.ts`
-and into the `runMigrations` list in `main.ts`.
+Orchestration has only the kit collections (`events`, `commands`,
+`counters`, `processed`; ARCHITECTURE 7). Its one own migration,
+`001-timers`, adds two partial indexes on `events` for the timers; it is
+in `src/adapters/timers.ts` and in the `runMigrations` list in `main.ts`.
+The timers use no new collection: a fired timer is a `processed` marker
+with the `eventId` of its `SubtaskRetrying` or `CheckpointOpened`.
 
 ## Coverage gates (ADR 0017)
 
@@ -44,6 +51,10 @@ for all included files together:
 
 - `test:domain`: `src/domain`, 90% lines and 85% branches.
 - `test:unit`: `src` without `main.ts`, 70% lines.
+
+`test/unit/run.test.ts` is the table test of the run process manager:
+one row for each line of the contracts status table, and a test for each
+input in each state. Add a row or a test for each new event or input.
 
 `main.ts` is wiring. The integration test covers it through `start()`.
 

@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Run process manager and Task aggregate (task M3-02), contracts v0.4.1:
+  all task and subtask states of the status table, `StartRun` from an
+  approved plan, DAG scheduling with at most `MAX_PARALLEL_SUBTASKS`
+  subtasks (default 3), one `CallRequested` (`kind` `subtask`) for each
+  try, 3 tries with backoff (`SUBTASK_RETRY_DELAYS_MS`), then
+  `SubtaskFailed` and `RunBlocked` `subtask_failed`. Checkpoints for
+  `needsApproval` (`Approval needed for <title>`, deadline
+  `CHECKPOINT_TIMEOUT_MS`); a refused or expired checkpoint fails the
+  subtask and blocks the run. Pause, resume, cancel, `TaskCancelled`,
+  retry of a subtask, resolve of a checkpoint (domain inputs for M3-04).
+- `CallSettled` for each final attempt of a call with a `kind`, with the
+  call totals (or the values of that attempt). The task cost and
+  `maxCostMicroUsd` come from `CallSettled`. Runaway rules give
+  `SubtaskBlocked` and `RunBlocked` `runaway_stopped`.
+- Subtask inputs as data blocks: the `owner_message` block, one for each
+  steer, and one `subtask_output` block for each dependency with the
+  `callId` of its call as the block id.
+- A `steer` for a planned run with a subtask that has not started gives
+  `SteeringMessageAdded`. The stale `RunFailed` of a chat task also gives
+  `CallCancelRequested`.
+- Timers from the `SubtaskRetrying` and `CheckpointOpened` events and the
+  `processed` markers (no new collection), new migration `001-timers`,
+  `TIMER_INTERVAL_MS`.
+- `RunCompleted` of a planned run has the outputs in plan order (M3-03
+  changes it to the aggregate call).
+- Subtask agents are read by id from agent-manager
+  (`/internal/agents/:agentId/active-version`, not there yet).
+- A chat `new_task` stays the M2 one-agent run, with no `CallSettled`.
+- Deploy with the strategy `Recreate`, after conversation-hub,
+  projections and ai-proxy are on v0.4.1 (contracts CHANGELOG 0.4.1).
+
 - One agent run for a chat message (task M2-06): a consumer of
   `conversation.OwnerMessagePosted` gives `TaskSubmitted` (with
   `conversationId` and `messageId`), `RunStarted` and `CallRequested` for
